@@ -1,0 +1,7 @@
+# RWKV-7 + OpenVINO 推理验证环境（已在 pyenv python3.11.1 实测）
+# 注意：本机环境为 OpenVINO 2026.3 系列，需 Python>=3.10 且非系统 python3.12（PEP668）
+openvino==2026.3.0
+openvino-genai==2026.3.0
+nncf==3.3.0
+torch==2.10.0
+numpy

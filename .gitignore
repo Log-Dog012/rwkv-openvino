@@ -1,0 +1,16 @@
+# 大权重与导出产物（体积巨大，不入库；用云盘/模型源分发）
+models/
+out/
+*.pth
+*.safetensors
+*.bin
+*.xml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 临时诊断
+temp/
+*.log
