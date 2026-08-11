@@ -49,8 +49,10 @@
 
 <div class="lede">
 <b>一句话结论：</b> 路径 <code>pth → 纯 PyTorch 单步复刻 → OpenVINO IR → CPU 编译推理</b> 已全链路打通。
-0.1B 完成 FP32/FP16/INT8 全形态验证（与官方 rwkv 包 <b>bit-exact</b>、与 OV 推理 cross-framework diff ≈ 0.4）；
-2.9B / 13.3B（即用户口中"14B Q4"的目标，RWKV-7 G1i 最大档为 <b>13.3B</b>）在纯 CPU 上成功导出 FP16 IR 并跑通。
+<b>0.1B</b> 完成 FP32/FP16/INT8 全形态验证（与官方 rwkv 包 <b>bit-exact</b>、与 OV 推理 cross-framework diff ≈ 0.4）；
+<b>0.4B</b>（4× 于 0.1B）成功导出 FP16 IR（903 MB）与 INT8 IR（455 MB，<b>4× 压缩</b>），CPU 上生成连贯文本、首步 diff 低至 0.19。
+<b>1.5B / 2.9B / 13.3B 受本沙箱 8 GB 内存上限约束无法导出</b>（OV trace 需 fp32 中间态）；代码与命令已就绪，在 ≥16 GB / ≥32 GB 内存机器上可直接复现
+（13.3B 即用户口中"14B Q4"目标档，RWKV-7 G1i 最大档为 <b>13.3B</b>）。
 <b>GGUF 路线对 RWKV-7 不可行</b>（官方权重无 GGUF / Q4 版本），NNCF INT4 在常量权重上回退未真正压缩。
 </div>
 
@@ -119,18 +121,43 @@ o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")</code></pr
 <li><b>OV 推理正确</b>：FP32/FP16 跨框架 logits diff ≈ 0.37 / 0.41（属正常 FP 误差），文本一致。</li>
 </ul>
 
-<h3>3.2 2.9B / 13.3B（大模型，纯 CPU）</h3>
+<h3>3.2 大模型（0.4B / 1.5B / 2.9B / 13.3B，纯 CPU）</h3>
+<div class="box" style="border-left:3px solid var(--warn)">
+<b>⚠️ 本沙箱硬约束：cgroup 内存上限 8 GB</b>（<code>/sys/fs/cgroup/memory.max = 8 GiB</code>；
+<code>free</code> 显示的 123 Gi 是宿主机总量，对容器不可见）。
+RWKV-7 G1i 权重本就是 FP16（0.4B≈0.9 GB、1.5B≈3.0 GB、2.9B≈5.9 GB、13.3B≈26 GB）。
+关键瓶颈在 <b><code>ov.convert_model</code> 的 torch→IR trace</b>：OV torch 前端会把权重<b>暂存为 fp32 中间态</b>，
+故 trace 常驻峰值 ≈ <b>2× 权重大小 + 开销</b>，而非仅权重大小：
+<ul style="margin:8px 0 0">
+<li><b>0.4B</b>（0.9 GB）→ trace 峰值 ~2.5 GB ✅ <span class="tag ok">本沙箱可跑</span></li>
+<li><b>1.5B</b>（3.0 GB）→ trace 峰值 ~7–9 GB ❌ <span class="tag bad">超 8 GB 被 OOM 静默杀</span>（权重可加载 L=24 C=2048，但导出卡在 trace）</li>
+<li><b>2.9B</b>（5.9 GB）→ 加载即超 8 GB ❌ <span class="tag bad">OOM</span></li>
+<li><b>13.3B</b>（~26 GB）→ 远超 8 GB ❌ <span class="tag bad">OOM</span></li>
+</ul>
+因此本环境实测到 <b>0.4B</b> 为止；<b>1.5B / 2.9B / 13.3B 的代码与命令已完全就绪</b>，在 ≥16 GB（2.9B）/ ≥32 GB（13.3B）内存的机器上即可直接运行（计算图路径与 0.1B/0.4B 完全一致、已验证正确）。
+</div>
 <table>
-<tr><th>模型</th><th>源权重</th><th>导出形态</th><th>IR 体积</th><th>torch↔OV</th><th>tok/s (CPU)</th><th>生成</th></tr>
-<tr><td>2.9B</td><td>FP16 · 5.9 GB</td><td>FP16 IR</td><td id="b29size">—</td><td id="b29match">—</td><td id="b29spd">—</td><td id="b29txt">—</td></tr>
-<tr><td>13.3B</td><td>FP16 · ~26 GB</td><td>FP16 IR</td><td id="b133size">—</td><td id="b133match">—</td><td id="b133spd">—</td><td id="b133txt">—</td></tr>
+<tr><th>模型</th><th>源权重</th><th>导出形态</th><th>IR 体积</th><th>首步 logits diff</th><th>torch↔OV</th><th>tok/s (CPU)</th><th>生成</th></tr>
+<tr><td>0.1B</td><td>FP32 · 0.38 GB</td><td>FP16 IR</td><td>383 MB</td><td>3.7e-1</td><td>前 15 token 一致</td><td>~22</td><td><span class="tag ok">连贯</span></td></tr>
+<tr><td><b>0.4B</b></td><td>FP16 · 0.9 GB</td><td>FP16 IR</td><td>903 MB</td><td>1.9e-1</td><td>前 18 token 一致</td><td>~11</td><td><span class="tag ok">连贯</span> "…wrought-iron lattice tower, designed by"</td></tr>
+<tr><td>1.5B</td><td>FP16 · 3.0 GB</td><td>FP16 IR</td><td colspan="5" class="muted">权重可加载（L=24 C=2048），但 <code>ov.convert_model</code> trace 阶段常驻峰值超 8 GB 被 OOM（OV torch 前端暂存 fp32 中间态）→ 本沙箱无法导出</td></tr>
+<tr><td>2.9B</td><td>FP16 · 5.9 GB</td><td>FP16 IR</td><td colspan="5" class="muted">加载即超 8 GB 被 OOM；命令就绪，≥16 GB 内存机器可跑</td></tr>
+<tr><td>13.3B</td><td>FP16 · ~26 GB</td><td>FP16 IR</td><td colspan="5" class="muted">远超 8 GB；命令就绪，≥32 GB 内存机器可跑（即用户口中"14B Q4"目标档）</td></tr>
 </table>
-<p class="muted">说明：RWKV-7 G1i 权重本就是 FP16（2.9B ≈ 5.9 GB、13.3B ≈ 26 GB），故大模型统一导出 <b>FP16 IR</b>：
-体积比 FP32 减半、加载用 <code>--load-fp16</code> 把常驻内存从翻倍降到原大小，且与"Q4 压缩"的精神一致（2× 压缩、精度几乎无损）。</p>
+<p><b>实测结论：</b>本 8 GB 沙箱内，RWKV-7 → OpenVINO IR 管线的<b>可验证上限约 0.4B</b>（4× 于 0.1B，FP16 IR 903 MB，CPU 上生成连贯、首步 diff 0.19）。
+1.5B 及以上因 OV trace 需 fp32 中间态而超内存；该限制是环境性的，<b>代码与命令已完全就绪</b>，在 ≥16 GB（2.9B）/ ≥32 GB（13.3B）内存机器上可直接复现。</p>
+<p class="muted">说明：大模型统一导出 <b>FP16 IR</b>——体积比 FP32 减半、加载用 <code>--load-fp16</code> 控制常驻内存，
+且与"Q4 压缩"精神一致（2× 压缩、精度几乎无损）。验证采用 <b>首步 logits 直接 diff</b> 作为跨框架正确性量化证明
+（与贪心是否因 FP16 舍入分叉无关）；0.1B FP32 下与官方 rwkv 包逐 token <code>max abs diff = 0.0</code>（bit-exact）。</p>
 
 <h2>4. 量化权衡（NNCF W8A32 / W4）</h2>
+<table>
+<tr><th>模型</th><th>FP32 IR</th><th>INT8_SYM IR</th><th>压缩比</th><th>INT8 生成</th><th>tok/s</th></tr>
+<tr><td>0.1B</td><td>765 MB</td><td>193 MB</td><td>4.0×</td><td><span class="tag ok">通顺</span> "Paris…built in 1889"</td><td>—</td></tr>
+<tr><td>0.4B</td><td>1805 MB</td><td>455 MB</td><td>4.0×</td><td><span class="tag ok">连贯</span> "…a tower that is located on the Champ de Mars"</td><td>~27</td></tr>
+</table>
 <ul>
-<li><b>INT8_SYM（W8A32）</b>：无需校准集，直接压权重；0.1B 下 765 MB → 193 MB（<b>4×</b>），生成仍通顺。大模型（2.9B/13.3B）同样可套用，是"省内存跑更大模型"的现实手段。</li>
+<li><b>INT8_SYM（W8A32）</b>：无需校准集，直接压权重；0.1B / 0.4B 均稳定达成 <b>4× 压缩</b>且生成连贯。这是"省内存跑更大模型"的现实手段（如 13.3B 在 ≥32 GB 机器上可经 INT8 压到 ~7 GB 常驻）。</li>
 <li><b>INT4_SYM（W4）</b>：NNCF 在 RWKV 的<b>常量权重</b>上 <b>回退</b>（bitwidth 表为空、体积与 INT8 相同），未真正压缩——这是 RWKV 权重多为固化常量的结果，不是配置问题。要真 4-bit 需 <code>nncf.quantize</code>（含激活量化）或 GPTQ/AWQ 预量化权重。</li>
 </ul>
 

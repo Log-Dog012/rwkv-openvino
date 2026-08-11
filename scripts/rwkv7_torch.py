@@ -54,8 +54,22 @@ class RWKV7(nn.Module):
             self.register_buffer(bn, v, persistent=False)
             self._map[k] = bn
 
+        self._raw = raw
+        self._z = z
+        self.free_source()  # 权重已固化为 buffer，释放原始引用降峰值
+
     def w(self, k: str) -> torch.Tensor:
         return getattr(self, self._map[k])
+
+    # 内存卫生：权重已 register_buffer 固化进 IR 常量，及时释放原始 state_dict 与中间字典，
+    # 降低大模型 convert_model 时的常驻峰值（本沙箱 cgroup 仅 8GB）。
+    def free_source(self):
+        import gc
+        if hasattr(self, "_raw"):
+            del self._raw
+        if hasattr(self, "_z"):
+            del self._z
+        gc.collect()
 
     def zero_state(self):
         L, C, H, N = self.n_layer, self.n_embd, self.n_head, self.head_size
