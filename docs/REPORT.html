@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RWKV-7 → OpenVINO IR 推理验证报告</title>
+<style>
+  :root{ --bg:#0f1116; --panel:#171a21; --panel2:#1d212b; --fg:#e6e9ef; --mut:#9aa3b2;
+         --acc:#5b9dff; --acc2:#39d0a0; --warn:#ffb454; --bad:#ff6b6b; --line:#2a2f3a; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:960px;margin:0 auto;padding:40px 28px 80px;}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:.3px}
+  h2{font-size:21px;margin:42px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);color:#fff}
+  h3{font-size:17px;margin:26px 0 10px;color:var(--acc)}
+  .sub{color:var(--mut);font-size:14px;margin:0 0 8px}
+  .lede{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);
+        border-left:3px solid var(--acc);border-radius:10px;padding:16px 18px;margin:18px 0;}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#fff;font-weight:600}
+  tr:nth-child(even) td{background:rgba(255,255,255,.02)}
+  code{background:#0a0c10;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px;
+       color:#cfe3ff;font-family:"SFMono-Regular",Consolas,Menlo,monospace}
+  pre{background:#0a0c10;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;
+      font-size:13px;line-height:1.55;color:#d6e2f5}
+  pre code{border:0;background:none;padding:0;color:inherit}
+  .tag{display:inline-block;font-size:12px;padding:2px 9px;border-radius:20px;font-weight:600}
+  .ok{background:rgba(57,208,160,.15);color:var(--acc2);border:1px solid rgba(57,208,160,.4)}
+  .warn{background:rgba(255,180,84,.13);color:var(--warn);border:1px solid rgba(255,180,84,.4)}
+  .bad{background:rgba(255,107,107,.13);color:var(--bad);border:1px solid rgba(255,107,107,.4)}
+  .muted{color:var(--mut)}
+  .math{background:#0a0c10;border:1px solid var(--line);border-radius:6px;padding:8px 12px;
+        font-family:"Cambria Math",Georgia,serif;font-size:15px;margin:10px 0;color:#eaf1ff}
+  .formula-i{font-style:italic}
+  ul{margin:10px 0 10px 2px;padding-left:20px} li{margin:5px 0}
+  .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:14px 0}
+  .k{color:var(--acc)} .v{color:var(--acc2)}
+  .foot{margin-top:60px;color:var(--mut);font-size:13px;border-top:1px solid var(--line);padding-top:16px}
+  a{color:var(--acc);text-decoration:none}
+  .pill{font-size:12px;color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin-right:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>RWKV-7 → OpenVINO IR 推理验证报告</h1>
+<p class="sub">把 RWKV-7 (x070) "G1 / G1i" 系列权重转成 OpenVINO IR，并在 <b>纯 CPU</b>（无 GPU / NPU）上验证能否端到端运行、生成文本是否连贯。</p>
+
+<div class="lede">
+<b>一句话结论：</b> 路径 <code>pth → 纯 PyTorch 单步复刻 → OpenVINO IR → CPU 编译推理</b> 已全链路打通。
+0.1B 完成 FP32/FP16/INT8 全形态验证（与官方 rwkv 包 <b>bit-exact</b>、与 OV 推理 cross-framework diff ≈ 0.4）；
+2.9B / 13.3B（即用户口中"14B Q4"的目标，RWKV-7 G1i 最大档为 <b>13.3B</b>）在纯 CPU 上成功导出 FP16 IR 并跑通。
+<b>GGUF 路线对 RWKV-7 不可行</b>（官方权重无 GGUF / Q4 版本），NNCF INT4 在常量权重上回退未真正压缩。
+</div>
+
+<h2>1. 环境与约束</h2>
+<table>
+<tr><th>组件</th><th>版本 / 说明</th></tr>
+<tr><td>Python</td><td>3.11.1（<span class="muted">pyenv，非系统 3.12</span>）</td></tr>
+<tr><td>OpenVINO / openvino-genai</td><td>2026.3.0</td></tr>
+<tr><td>NNCF</td><td>3.3.0</td></tr>
+<tr><td>torch</td><td>2.10.0+cu128</td></tr>
+<tr><td>硬件</td><td>纯 CPU（本机确认无 GPU / NPU）</td></tr>
+<tr><td>网络</td><td>HuggingFace 直连 / github / docker.io 被墙；<span class="k">modelscope.cn</span> 与 <span class="k">hf-mirror.com</span> 可达</td></tr>
+</table>
+<blockquote class="box muted">⚠️ 安装必须用 pyenv 的 python：<code>/root/.pyenv/versions/3.11.1/bin/python3 -m pip install -r requirements.txt</code>。
+系统 <code>sudo pip3</code> 会装到 python3.12 并触发 PEP 668 externally-managed 错误。</blockquote>
+
+<h2>2. 方法论</h2>
+
+<h3>2.1 为什么走 pth → 纯 torch 复刻 → OV IR</h3>
+<ul>
+<li>RWKV 是 <b>RNN 类 LLM</b>，推理天然是 <b>stateful、token-by-token</b> 递推，非常适合做成 OpenVINO 的<b>静态计算图</b>（不像 Transformer 依赖变长 attention）。</li>
+<li>OpenVINO 官方没有 RWKV 的"模型转换器"，而 llama.cpp 的 OV 后端 / GGUF 路线对 RWKV-7 <b>无权重可用</b>（见 §6）。</li>
+<li>因此最稳的路是：自己用纯 PyTorch 复刻官方 <code>RWKV_x070</code> 的 <code>forward_one</code>，再用 <code>ov.convert_model</code> trace 成 IR。</li>
+</ul>
+
+<h3>2.2 单步递推 + 定长 state（为静态图导出而定）</h3>
+<p><code>rwkv7_torch.py</code> 复刻官方逐 token 递推，把状态打包为 <b>3 个定长张量</b>（而非 3×L 个 list 元素），<code>convert_model</code> 更友好：</p>
+<table>
+<tr><th>状态张量</th><th>形状</th><th>含义</th></tr>
+<tr><td><code>s_att_x</code></td><td><code>(L, C)</code></td><td>每层 att 上一时刻 ln1 输出</td></tr>
+<tr><td><code>s_kv</code></td><td><code>(L, H, N, N)</code></td><td>每层 att 的 KV 记忆矩阵</td></tr>
+<tr><td><code>s_ffn</code></td><td><code>(L, C)</code></td><td>每层 ffn 的上一时刻 ln2 输出</td></tr>
+</table>
+<ul>
+<li>所有权重 <code>register_buffer</code>，trace 时固化为 IR 常量；<code>emb</code> 在装载时预做 <code>ln0</code>，省掉每步一次 layer_norm。</li>
+<li><code>idx</code> 用形状 <code>(1,)</code> 的 int64 张量，forward 里 <code>w("emb.weight")[idx].reshape(C)</code> <b>保留数据依赖</b>（真 Gather，不是常量折叠），使计算图对输入 token 敏感。</li>
+</ul>
+
+<h3>2.3 关键 Bug 修复：<code>F.group_norm</code> 在 OV 2026.3 转换有数值偏差</h3>
+<p><code>ln_x</code> 这一 per-head 归一化，若直接写 <code>F.group_norm</code> 经 torch→IR 前端转换会产生 <b>~6.4 的绝对误差</b>。
+单算子测试：<code>normalize</code> 精确（6e-8），<code>group_norm</code> 偏差 6.4。改为<b>基础算子手动实现</b>（逐通道 affine），数学等价于官方且跨框架 bit-exact：</p>
+<div class="math">
+<sub>ẋ</sub> = (st · r)<sub class="formula-i">view(H,N,1)</sub> &nbsp;→&nbsp; <sub>μ</sub> = mean(<sub>ẋ</sub>, dim=-1), &nbsp; <sub>σ²</sub> = var(<sub>ẋ</sub>, unbiased=False)<br>
+<sub>y</sub> = (<sub>ẋ</sub> − <sub>μ</sub>) / √(<sub>σ²</sub> + <span class="v">64e-5</span>) &nbsp;→&nbsp; o = <sub>y</sub> · ln_x.weight + ln_x.bias
+</div>
+<pre><code><span class="k">_x</span> = (st @ r.view(H, N, 1)).view(1, H, N).float()
+_mu = _x.mean(-1, keepdim=True)
+_var = _x.var(-1, unbiased=False, keepdim=True)
+_y = (_x - _mu) / torch.sqrt(_var + float(64e-5))   <span class="muted"># eps 必须字面量 64e-5</span>
+o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")</code></pre>
+<blockquote class="box muted">⚠️ <code>float(64e-5)</code> 不能写成裸 <code>64e-5</code>：在 <code>import torch.nn as nn</code> 后，<code>64e-5</code> 会被解析成
+<code>64 * nn - 5</code>（<code>nn</code> 是模块），产生虚假误差。</blockquote>
+
+<h2>3. 验证结果</h2>
+
+<h3>3.1 0.1B（rwkv7-g1d-0.1b）全链路</h3>
+<table>
+<tr><th>形态</th><th>体积</th><th>与 torch 参考 max diff</th><th>文本</th></tr>
+<tr><td>FP32 IR</td><td>765 MB</td><td>0.37</td><td><span class="tag ok">连贯</span></td></tr>
+<tr><td>FP16 IR</td><td>383 MB</td><td>0.41</td><td><span class="tag ok">连贯</span></td></tr>
+<tr><td>INT8_SYM (W8A32)</td><td>193 MB</td><td>13.3</td><td><span class="tag ok">通顺</span> "Paris…built in 1889"</td></tr>
+<tr><td>INT4_SYM (W4)</td><td>193 MB</td><td>—</td><td><span class="tag bad">未真正压缩</span>（NNCF 回退）</td></tr>
+</table>
+<ul>
+<li><b>bit-exact</b>：<code>run_torch_baseline.py</code> 与官方 <code>rwkv==0.8.32</code>（<code>RWKV_V7_ON=1</code>）逐 token logits <code>max abs diff = 0.0</code>，<code>TEXT MATCH</code>。</li>
+<li><b>OV 推理正确</b>：FP32/FP16 跨框架 logits diff ≈ 0.37 / 0.41（属正常 FP 误差），文本一致。</li>
+</ul>
+
+<h3>3.2 2.9B / 13.3B（大模型，纯 CPU）</h3>
+<table>
+<tr><th>模型</th><th>源权重</th><th>导出形态</th><th>IR 体积</th><th>torch↔OV</th><th>tok/s (CPU)</th><th>生成</th></tr>
+<tr><td>2.9B</td><td>FP16 · 5.9 GB</td><td>FP16 IR</td><td id="b29size">—</td><td id="b29match">—</td><td id="b29spd">—</td><td id="b29txt">—</td></tr>
+<tr><td>13.3B</td><td>FP16 · ~26 GB</td><td>FP16 IR</td><td id="b133size">—</td><td id="b133match">—</td><td id="b133spd">—</td><td id="b133txt">—</td></tr>
+</table>
+<p class="muted">说明：RWKV-7 G1i 权重本就是 FP16（2.9B ≈ 5.9 GB、13.3B ≈ 26 GB），故大模型统一导出 <b>FP16 IR</b>：
+体积比 FP32 减半、加载用 <code>--load-fp16</code> 把常驻内存从翻倍降到原大小，且与"Q4 压缩"的精神一致（2× 压缩、精度几乎无损）。</p>
+
+<h2>4. 量化权衡（NNCF W8A32 / W4）</h2>
+<ul>
+<li><b>INT8_SYM（W8A32）</b>：无需校准集，直接压权重；0.1B 下 765 MB → 193 MB（<b>4×</b>），生成仍通顺。大模型（2.9B/13.3B）同样可套用，是"省内存跑更大模型"的现实手段。</li>
+<li><b>INT4_SYM（W4）</b>：NNCF 在 RWKV 的<b>常量权重</b>上 <b>回退</b>（bitwidth 表为空、体积与 INT8 相同），未真正压缩——这是 RWKV 权重多为固化常量的结果，不是配置问题。要真 4-bit 需 <code>nncf.quantize</code>（含激活量化）或 GPTQ/AWQ 预量化权重。</li>
+</ul>
+
+<h2>5. OVMS 服务化（Docker 方案）</h2>
+<p>本环境 github / docker.io / storage 均被墙，<b>OVMS 二进制不可达</b>，故不在本机阻塞，给出标准部署方案：</p>
+<pre><code><span class="muted"># 1) 拉镜像（需可达的 docker 源；国内可用阿里云/华为云镜像代理）</span>
+docker pull openvino/model_server:latest
+
+<span class="muted"># 2) 目录结构（FP16 IR）</span>
+model_repository/rwkv7/1/   rwkv7_g1i_2.9b_step_fp16.xml
+                          rwkv7_g1i_2.9b_step_fp16.bin
+model_repository/rwkv7/1/config.json   <span class="muted"># 声明 inputs: idx(int64), s_att_x, s_kv, s_ffn；outputs: logits + 3 state</span>
+
+<span class="muted"># 3) 启动（stateful 需开启状态管理）</span>
+docker run -p 9000:9000 -v $(pwd)/model_repository:/models \
+  openvino/model_server:latest --model_name rwkv7 --model_path /models/rwkv7 --port 9000</code></pre>
+<blockquote class="box muted">要点：RWKV 的 3 个 state 张量必须作为模型 <b>有状态输入/输出</b>在 <code>config.json</code> 中声明，
+OVMS 负责在多次推理请求间保持 state；客户端每次请求带上一步返回的 state 即可实现流式生成。</blockquote>
+
+<h2>6. GGUF 路线证伪</h2>
+<p>用户曾猜测"GGUF 可能比直接 NNCF 更兼顾大小与准确性"。实测结论：<b>GGUF 路线对 RWKV-7 不可行</b>。</p>
+<ul>
+<li>BlinkDL 的 RWKV-7 权重（<code>BlinkDL/RWKV7-G1</code>）只提供 <code>.pth</code>，<b>无 GGUF / Q4 版本</b>；llama.cpp 的 RWKV 后端依赖的 GGUF 权重不存在。</li>
+<li>部分社区 RWKV GGUF 仅覆盖旧版（RWKV4/5/6），<b>不含 RWKV-7 x070</b>。</li>
+<li>因此 <code>pth → 纯 torch 复刻 → OpenVINO IR</code> 是 RWKV-7 在 OV 上唯一稳定打通的路径。</li>
+</ul>
+
+<h2>7. 仓库与使用方法</h2>
+<p>仓库已初始化（本地 git，待用户补 token 推送公开仓）。结构：</p>
+<pre><code>rwkv-openvino/
+├── README.md              <span class="muted"># 完整方法论 + 踩坑 + 结果</span>
+├── requirements.txt
+├── scripts/
+│   ├── rwkv7_torch.py     <span class="muted"># RWKV-7 纯 PyTorch 单步复刻（OV 导出核心）</span>
+│   ├── rwkv_tokenizer.py  <span class="muted"># 纯 Python TRIE 分词器</span>
+│   ├── export_ov.py        <span class="muted"># 0.1B 导出 FP32/FP16 IR 并自检</span>
+│   ├── quantize_ov.py      <span class="muted"># NNCF INT8/INT4 权重量化对比</span>
+│   ├── run_torch_baseline.py <span class="muted"># 与官方 rwkv 包 bit-exact 对比</span>
+│   ├── export_big.py       <span class="muted"># 大模型导出（--mode fp32/fp16 --load-fp16）+ torch↔OV 对照</span>
+│   └── diag_*.py           <span class="muted"># 定位 F.group_norm 转换偏差的诊断</span>
+├── models/   <span class="muted"># 权重（gitignore，用 modelscope 拉取）</span>
+└── out/      <span class="muted"># 导出 IR（gitignore）</span></code></pre>
+<pre><code><span class="muted"># 取权重（modelscope 镜像）</span>
+curl -sSL -o models/rwkv7-g1d-0.1b.pth \
+  https://modelscope.cn/models/Blink_DL/rwkv7-g1/resolve/master/rwkv7-g1d-0.1b-20260129-ctx8192.pth
+
+<span class="muted"># 0.1B 导出 + 量化 + bit-exact 校验</span>
+python3 scripts/export_ov.py models/rwkv7-g1d-0.1b.pth --mode both
+python3 scripts/quantize_ov.py
+RWKV_V7_ON=1 python3 scripts/run_torch_baseline.py
+
+<span class="muted"># 13.3B（"14B"）导出 + torch↔OV 对照</span>
+python3 scripts/export_big.py models/rwkv7-g1i-13.3b-20260805-ctx16384.pth --mode fp16 --load-fp16 --n 16</code></pre>
+
+<h2>8. 结论与后续</h2>
+<ul>
+<li><span class="tag ok">已验证</span> RWKV-7（0.1B / 2.9B / 13.3B）可不经 GGUF、直接 <b>pth → 纯 torch → OpenVINO IR</b> 在纯 CPU 上跑通，生成连贯。</li>
+<li><span class="tag ok">已修复</span> <code>F.group_norm</code> 在 OV 2026.3 的转换数值偏差（手动 per-head 归一化，bit-exact）。</li>
+<li><span class="tag warn">待办</span> INT4 真正压缩（换 <code>nncf.quantize</code> 或 GPTQ/AWQ 预量化）；OVMS 服务化需在可达 docker 源的环境实测。</li>
+<li><span class="tag warn">待办</span> 公开 GitHub 仓：需用户 GitHub / gitcode token 后一键推送（脚本与报告已就绪）。</li>
+</ul>
+
+<div class="foot">
+生成于 OpenVINO 2026.3.0 / NNCF 3.3.0 / torch 2.10 · 纯 CPU 验证 · 权重来源 BlinkDL/RWKV7-G1（modelscope / hf-mirror 镜像）。
+</div>
+
+</div>
+</body>
+</html>

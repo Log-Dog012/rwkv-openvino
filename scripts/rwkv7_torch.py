@@ -115,11 +115,13 @@ class RWKV7(nn.Module):
 
             # per-head 归一化（ln_x），逐通道 affine（数学等价于 F.group_norm）。
             # 不用 F.group_norm：OpenVINO 2026.3 的 torch->IR 前端转换该算子有数值偏差。
-            _x = (st @ r.view(H, N, 1)).view(1, H, N).float()
+            # 为数值稳定，var/sqrt 在 float32 算，结果 cast 回 x.dtype，
+            # 这样 --load-fp16（Half 权重）下后续矩阵乘 dtype 一致，FP32 路径则 identity 不受影响。
+            _x = (st @ r.view(H, N, 1)).view(1, H, N).to(torch.float32)
             _mu = _x.mean(-1, keepdim=True)
             _var = _x.var(-1, unbiased=False, keepdim=True)
             _y = (_x - _mu) / torch.sqrt(_var + float(64e-5))
-            o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")
+            o = _y.view(1, H * N).to(x.dtype) * w(att + "ln_x.weight") + w(att + "ln_x.bias")
             o = o + ((r * k * w(att + "r_k")).view(H, N).sum(dim=-1, keepdim=True)
                      * v.view(H, N)).view(H * N)
 

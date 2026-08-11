@@ -34,7 +34,7 @@ def greedy_torch(m, n, tok):
     return gen
 
 
-def greedy_ov(comp, ins, m, n, tok):
+def greedy_ov(comp, req, ins, m, n, tok):
     ids = tok.encode(PROMPT)
     L, H, N, C = m.n_layer, m.n_head, m.head_size, m.n_embd
     s_att_x, s_kv, s_ffn = [x.numpy() for x in m.zero_state()]
@@ -42,7 +42,7 @@ def greedy_ov(comp, ins, m, n, tok):
     for t in ids + [None] * n:
         if t is None:
             t = int(np.argmax(o[0]))
-        o = comp.infer({ins[0]: np.array([t], dtype=np.int64),
+        o = req.infer({ins[0]: np.array([t], dtype=np.int64),
                        ins[1]: s_att_x, ins[2]: s_kv, ins[3]: s_ffn})
         s_att_x = np.asarray(o[1]).reshape(L, C)
         s_kv = np.asarray(o[2]).reshape(L, H, N, N)
@@ -50,6 +50,19 @@ def greedy_ov(comp, ins, m, n, tok):
         if t is not None:
             gen.append(t)
     return gen
+
+
+def first_step_diff(m, comp, req, ins, tok):
+    """首步 logits 直接 diff：跨框架正确性量化证明（与贪心是否分叉无关）。"""
+    L, H, N, C = m.n_layer, m.n_head, m.head_size, m.n_embd
+    t0 = tok.encode(PROMPT)[0]
+    with torch.no_grad():
+        rl, *_ = m(torch.tensor([t0]), *m.zero_state())
+    o = req.infer({ins[0]: np.array([t0], dtype=np.int64),
+                   ins[1]: m.zero_state()[0].numpy(),
+                   ins[2]: m.zero_state()[1].numpy(),
+                   ins[3]: m.zero_state()[2].numpy()})
+    return float((torch.from_numpy(np.asarray(o[0])).float() - rl.float()).abs().max())
 
 
 def main():
@@ -90,13 +103,16 @@ def main():
     req = comp.create_infer_request()
     ins = [i.any_name for i in comp.inputs]
     t0 = time.time()
-    gv = greedy_ov(comp, ins, m, a.n, tok)
+    gv = greedy_ov(comp, req, ins, m, a.n, tok)
     dt = time.time() - t0
     print(f"[big]   OV    out: {tok.decode(gv)!r}  ({dt:.1f}s, {len(gv)/dt:.2f} tok/s)")
 
-    match = "EXACT MATCH" if gt == gv else \
-        f"DIFF @ first {next((i for i,(x,y) in enumerate(zip(gt,gv)) if x!=y), -1)}"
-    print(f"[big] TORCH vs OV: {match}  (torch_len={len(gt)} ov_len={len(gv)})")
+    match_len = next((i for i, (x, y) in enumerate(zip(gt, gv)) if x != y), min(len(gt), len(gv)))
+    match = "EXACT MATCH" if gt == gv else f"DIFF @ first {match_len}"
+    fsd = first_step_diff(m, comp, req, ins, tok)
+    print(f"[big]   first-step logits maxdiff (torch vs OV): {fsd:.4e}")
+    print(f"[big] TORCH vs OV: {match}  (torch_len={len(gt)} ov_len={len(gv)} "
+          f"first {match_len} tokens identical)")
 
 
 if __name__ == "__main__":
