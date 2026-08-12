@@ -148,3 +148,13 @@ python3.11 scripts/rwkv7_ov_layerwise.py \
   ```
 - **高频 commit + push**：对话是工作与远端仓库之间唯一的同步通道，崩溃即丢失自上次 push 后的工作。完成一个阶段性里程碑就 push 一次。
 - `.gitignore` 已忽略：`models/`、`out/`、`*.pth/*.safetensors/*.bin/*.xml`、`__pycache__/`、`temp/`、`*.log`。**切勿把 .gguf / 模型 commit 进仓库**。
+
+### 7.1 fastgit 代理已知 bug（2026-08-12 记录）
+
+- **症状**：`push main` 报 `cannot lock ref 'refs/heads/main': is at <新sha> but expected <旧sha>`，连 `--force` / `--force-with-lease` 都一样。删除分支也报 `reference already exists`。
+- **根因**：代理内部对已存在 ref 的缓存快照与实际远端不一致（main 快照停在 abc604b，实际已是 893023a），锁校验自相矛盾。**新建 ref 不受影响**。
+- **当前远端状态**：
+  - `main` = `893023a`（方向修复 + ln0 + 逐层执行器 + L=1 PASS + WORKLOG 全部核心工作）
+  - `agent-work` = `cc620b1`（+ AGENTS.md、git_push.sh、本段记录）
+  - `ag-test-cc620b1` = `cc620b1`（测试残留，删不掉，无害）
+- **约定**：日常 push 用 `bash scripts/git_push.sh`（优先 main，失败自动落 `agent-work`）。等代理恢复或能直连 GitHub 时，再把 `agent-work` 快进合并回 `main`。
