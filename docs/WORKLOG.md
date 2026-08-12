@@ -72,10 +72,15 @@
 | 验证 | 命令 | 结果 |
 |---|---|---|
 | L=1 head-to-head（numpy vs OV） | `validate_rwkv7_ov.py` | **PASS ✅** att=1.039e-3, kv=8.825e-3, ffn=5.594e-2（阈值 0.1）。OV 图在 fp16 精度内与 torch bit-exact 对齐 |
-| 4 层 smoke | `rwkv7_ov_layerwise.py --layers 4 --n 4` | 管线正确、能解码；输出乱码（只跑 4/24 层，非完整模型，**预期**） |
-| 全 24 层 layerwise 生成 | 见 §5 | **进行中** |
+| **全 24 层端到端生成（分块执行器）** | `rwkv7_ov_layerwise.py --chunk 8 --n 16` | **PASS ✅ 16/16 token ID 与 torch 基线完全一致**；文本 `' Paris, France.\nThe Eiffel Tower is a wrought-iron'` 逐字相同；峰值内存 <8GB |
+| torch 基线（1.5B GGUF） | `_torch_15b_ref.py` | 参考文本同上；top1=37138(logit 1.554)，16 个生成 token ID 已存 `temp/torch_15b_ref.json` |
 
 决定性证明脚本：`_orient_test.py`（方向）、`_cw_vs_bs_test.py`（cw vs torch 值对齐）。
+
+### 3.1 端到端验证中发现并修复的 2 个组合 bug（layerwise 谱系独有，主图 rwkv7_ov.py 无此问题）
+1. **v_first/vfix 缺失**：RWKV7 g1 架构要求 layer0 的原始 `v` 在同一 token 内传给所有层（`v_first`），layer1+ 用 `v += (v_first-v)*sigmoid(v0 + (xv@v1)@v2)`（vfix）。旧 layerwise 每层独立 embed 且无 vfix → 组合错误。分块执行器已实现 v_first 跨块线程传递。
+2. **ln_out 缺失**：torch 里最后一层 x 需先过 `output_norm` LayerNorm 再乘 `output.weight` 算 logits。旧 layerwise 直接 `x @ output.weight`。分块执行器已补。
+3. 旧 layerwise 的每层图都以 `gather(emb_table,idx)` 为输入（每层独立处理同一嵌入，激活不流动）——组合 bug，已随分块重构修复。
 
 ---
 
@@ -97,11 +102,12 @@
 
 ## 5. 当前进行中 / 待办
 
-- [进行中] **1.5B Q4 全 24 层 layerwise 生成**：确认连贯英文续写（基线 torch 预期 ~"...the city of, France. The Eiffel Tower is a wr..."）且峰值 < 8GB（靠 madvise 管理 GGUF 页）。
-- [待办] **7.2B Q4**（4.58GB GGUF）逐层构建/运行 < 8GB。
+- [✅ 完成] **1.5B Q4 全 24 层分块生成**：16/16 token 与 torch 基线一致，峰值 <8GB（分块 + v_first/ln_out 修复后）。
+- [待办] **7.2B Q4**（4.58GB GGUF）分块构建/运行 <8GB（chunk=4，每块 ~1.8GB）。
 - [待办] **13.3B Q4**（8.46GB GGUF）导出 IR —— 仅交付物，compile/run 超 8GB 不做。
-- [可选] OV export 加 `ov::cache_dir` + `OPTIMIZE_SIZE` 缓存 IR（参考 llama.cpp 路线）。
-- [风险预案] 若全 24 层**常驻 24 个编译模型**超 8GB → 实现**层分块（chunking）**：按 K 层分块，每块只常驻 K 个编译模型，块间传递激活、块内维护各层递归状态。
+- [可选] OV export 加 `ov::cache_dir` + `OPTIMIZE_SIZE` 缓存 IR（**注意**：本 OV 源码版 CPU 插件实测不支持 `cache_dir`，`compile_model` 直接报 NotFound；此路在源码版下走不通）。
+- [性能] 生成速度 ~17s/token（chunk 重载编译开销）；后续可研究常驻小 chunk + 其余用 IR 增量重载的折中。
+- [待查] 每编译层常驻 ~0.45GB（f16 精度/IR 文件编译均无改善）→ 疑似本 OV 源码版 CPU 插件**未真正融合 int4**、把权重解包成 f32 执行缓冲。若属实，将影响"原生 int4 速度"这一项目卖点，需用逐层计时验证。
 
 ---
 
