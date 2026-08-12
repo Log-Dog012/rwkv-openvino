@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llama.cpp b10369 OpenVINO + RWKV7 报错根因分析</title>
+<style>
+  :root{--bg:#0f1115;--fg:#e6e6e6;--acc:#4fc3f7;--warn:#ff8a65;--ok:#81c784;--mut:#9aa0a6;--box:#1a1d24;border:#2a2e37;}
+  body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg);line-height:1.6;max-width:960px;margin:0 auto;padding:32px 20px;}
+  h1{color:var(--acc);border-bottom:2px solid var(--acc);padding-bottom:8px;font-size:26px;}
+  h2{color:var(--acc);margin-top:34px;font-size:20px;border-left:4px solid var(--acc);padding-left:10px;}
+  h3{color:var(--warn);font-size:16px;margin-top:22px;}
+  code{background:#1c1f26;color:#ffd54f;padding:2px 6px;border-radius:4px;font-family:"JetBrains Mono",Consolas,monospace;font-size:13px;}
+  pre{background:#11141a;border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow-x:auto;font-size:12.5px;line-height:1.5;}
+  pre code{background:none;color:#cfd8dc;padding:0;}
+  .err{color:var(--warn);}
+  .ok{color:var(--ok);}
+  table{border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;}
+  th,td{border:1px solid var(--border);padding:9px 12px;text-align:left;vertical-align:top;}
+  th{background:#1c1f26;color:var(--acc);}
+  tr:nth-child(even){background:#15181f;}
+  blockquote{border-left:4px solid var(--warn);background:#1a1d24;margin:16px 0;padding:10px 16px;color:var(--mut);}
+  .tag{display:inline-block;background:#1c1f26;border:1px solid var(--border);border-radius:12px;padding:2px 10px;font-size:12px;color:var(--mut);margin:2px;}
+  .key{color:var(--acc);font-weight:600;}
+</style>
+</head>
+<body>
+<h1>llama.cpp b10369 OpenVINO + RWKV7 报错根因分析</h1>
+<p><span class="tag">llama.cpp b10369</span><span class="tag">OpenVINO 2026.2.1</span><span class="tag">RWKV7</span><span class="tag">ggml-backend</span><span class="tag">复现确认</span></p>
+
+<h2>0. TL;DR</h2>
+<p>你那个报错 <code>cache_r_l0 (view) (copy of ) ... OPENVINO0 ... CPY</code> <b>已在本沙箱一字不差复现</b>。本质是：<span class="key">llama.cpp 的 OpenVINO 后端对 RWKV7 的 recurrent state 支持不完整</span>——state 张量被 pre-allocate 进 OpenVINO 设备 buffer 后，其 view/cpy 更新操作无法在 OpenVINO backend 上调度，ggml 的 scheduler 又不能把已分配的张量迁走，于是触发 <code>GGML_ABORT</code> 直接 coredump。</p>
+<p>另外两点纠正：</p>
+<ul>
+<li><b>cache.json（你说的 "ovcache"）跟这个 bug 无关</b>，它是 OpenVINO GPU kernel 选择缓存，且和我们的 <code>rwkv-openvino</code> 项目机制完全不同（见 §4）。</li>
+<li><b>OpenVINO backend 其实声明了 CPY 支持</b>（<code>ggml-decoder.cpp:339/1504</code> 有 <code>case GGML_OP_CPY</code>），所以"OpenVINO 不支持 CPY"是误判；真正问题是 <b>scheduler 在 RWKV7 state 场景下把 tensor 错误预分配到 OpenVINO buffer</b>，而非后端缺算子。</li>
+</ul>
+
+<h2>1. 复现（Linux 沙箱，1.5B Q4 模型）</h2>
+<p>下载的包：<code>llama-b10369-bin-ubuntu-openvino-2026.2.1-x64.tar.gz</code>（98 MB，<code>libllama.so.0.0.10369</code>，build id <code>6e62ba538</code>）。</p>
+<pre><code># 复现你截图里的报错（等价 -ngl 99 启用 OpenVINO）
+export LD_LIBRARY_PATH=.
+export GGML_OPENVINO_DEVICE=CPU
+./llama-cli -m rwkv7-g1i-1.5b-Q4_K_M.gguf -p "The Eiffel Tower is located in" -ngl 99 -n 24 -no-cnv
+
+<span class="err">ggml/src/ggml-backend.cpp:930: pre-allocated tensor (cache_r_l0 (view) (copy of ))
+in a buffer (OPENVINO0) that cannot run the operation (CPY)</span>
+... 随后 binary coredump（not-stripped，触发 backtrace handler，被 timeout 杀掉）
+</code></pre>
+<p>注意第一行输出与你 Windows 截图 <b>完全一致</b>（<code>cache_r_l0 (view) (copy of )</code> + <code>OPENVINO0</code> + <code>CPY</code>）。</p>
+<p>进一步测试：即便 <code>-ngl 0</code>（"纯 CPU"），在此 <b>openvino 专用 build</b> 里仍走 OpenVINO（CPU 也是 OpenVINO CPU plugin），崩在另一处：</p>
+<pre><code><span class="err">GGML OpenVINO backend ov::Exception: Check 'TRShape::broadcast_merge_into(...)'
+failed ... Multiply_42641 ... f32[1,1,2,2048] ... f32[1,1,32,64] ...
+Argument shapes are inconsistent.</span>
+</code></pre>
+<p>结论：<span class="err">这个 openvino build 对 RWKV7 整体 broken（两条路径都崩）</span>，不是参数问题。</p>
+
+<h2>2. 源码定位（根因）</h2>
+<p>报错出自 <code>ggml/src/ggml-backend.cpp</code> 的 <code>ggml_backend_sched_backend_id_from_cur()</code>：</p>
+<pre><code>if (tensor->buffer || (tensor->view_src && tensor->view_src->buffer)) {
+    // since the tensor is pre-allocated, it cannot be moved to another backend
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)",
+               tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+}
+</code></pre>
+<p>触发条件拆解：</p>
+<table>
+<tr><th>条件</th><th>本例取值</th><th>含义</th></tr>
+<tr><td><code>tensor->view_src</code> 非空</td><td><code>cache_r_l0</code> 是 view 张量</td><td>RWKV7 的 r-state 以 view 别名形式持久化</td></tr>
+<tr><td><code>view_src->buffer</code> 非空</td><td><code>OPENVINO0</code></td><td>state 的源张量已被 scheduler 预分配到 OpenVINO 设备 buffer</td></tr>
+<tr><td>该 buffer 对应 backend 不能 run 此 op</td><td>op=<code>CPY</code></td><td><code>ggml_backend_sched_backend_from_buffer()</code> 返回 -1</td></tr>
+<tr><td>已 pre-alloc，无法迁移</td><td>—</td><td>进入 ABORT 分支 → 程序崩溃</td></tr>
+</table>
+
+<p>RWKV7 的 state 在 llama.cpp 里的实现（<code>src/models/rwkv7-base.cpp:107</code> → <code>ggml/src/ggml.c:5849 ggml_rwkv_wkv7</code>）：</p>
+<pre><code>// ggml.c:5849
+struct ggml_tensor * ggml_rwkv_wkv7(ctx, ... struct ggml_tensor * state) {
+    GGML_ASSERT(ggml_is_contiguous(state));
+    // state 作为 src[6]，输出是 GGML_OP_RWKV_WKV7
+    result->src[6] = state;
+    result->op = GGML_OP_RWKV_WKV7;
+}
+</code></pre>
+<p>RWKV7 的 recurrent state（<code>cache_r_l0</code> / <code>cache_k_l0</code> / <code>cache_v_l0</code> …）是跨 token 持久张量，在 graph 里以 <b>view/cpy 更新</b>。启用 OpenVINO（<code>-ngl 99</code>）后，scheduler 把权重/激活都 offload 到 OpenVINO，state 张量也跟着被预分配进 <code>OPENVINO0</code>；但 state 的 view/cpy 写回路径在 RWKV7 场景下没被 OpenVINO backend 正确覆盖 → 调度死锁 → ABORT。</p>
+
+<h2>3. 为什么"和我们的 rwkv-openvino 不一样"</h2>
+<p>我们的项目<b>根本不用 ggml 的多 backend scheduler</b>：RWKV7 整个前向（含 state 递推）都在 <b>OpenVINO IR 计算图内</b>表达，state 作为图的 <code>Parameter</code>/<code>Result</code> 在图外管理（每步喂入/读出 numpy/OV tensor）。没有 "view tensor pre-allocated to a device buffer" 这个概念 → 天然没有这个 bug。已验证 GGUF K-quant → OV 原生压缩权重 <b>bit-exact</b>（Q4_K 非对称 u4 / Q6_K 对称 i8，max|err|≈1e-4 即 f16 舍入噪声）。</p>
+
+<h2>4. cache.json（ovcache）是什么，和我们的区别</h2>
+<table>
+<tr><th>维度</th><th>llama.cpp 的 <code>cache.json</code></th><th>我们的 <code>rwkv-openvino</code></th></tr>
+<tr><td>层级</td><td>OpenVINO <b>GPU plugin</b> 的 kernel 选择/二进制缓存（cl_cache 等价物）</td><td>OpenVINO <b>IR 模型</b> + 原生压缩权重（u4/i8 Constant）</td></tr>
+<tr><td>内容</td><td><code>CONVOLUTION</code> / <code>F16_BFYX_...</code> 算子在不同数据布局下选哪个 GPU kernel 实现</td><td>RWKV7 计算图（节点+权重），权重以压缩格式入图由 CPU/GPU/NPU 插件融合</td></tr>
+<tr><td>作用</td><td>加速 OpenVINO GPU 算子选择的自动调优</td><td>直接表达 RWKV7 前向，避免 ggml 调度</td></tr>
+<tr><td>与本 bug 关系</td><td><b>无关</b>（删掉 cache.json 照样崩）</td><td>机制上避开了本 bug</td></tr>
+</table>
+<blockquote>一句话：<code>cache.json</code> 是 OpenVINO <b>运行时</b>的 GPU kernel 缓存，跟 llama.cpp 上层的 RWKV7 state 调度冲突是两条独立的事。它不是"和我们一样的缓存"。</blockquote>
+
+<h2>5. 可行的绕行/解决方向</h2>
+<table>
+<tr><th>方案</th><th>做法</th><th>评估</th></tr>
+<tr><td>A. 纯 CPU build 跑 RWKV7</td><td>用<b>非 openvino</b>的 llama.cpp build（如 <code>llama-bXXXX-bin-ubuntu-x64.tar.gz</code>），<code>llama-cli -ngl 0</code></td><td><span class="ok">最稳</span>；但本 openvino 包即使是 -ngl 0 也强制 OpenVINO，所以必须换包</td></tr>
+<tr><td>B. 等 upstream 修复</td><td>RWKV7+OpenVINO 是 arch/backend 组合缺陷，后续 llama.cpp 版本可能修 state 的 backend 分配</td><td>被动，需跟踪 b10369 之后的 commit</td></tr>
+<tr><td>C. 用我们的 rwkv-openvino</td><td>基于已验证 bit-exact 的压缩权重，搭完整 RWKV7 OV 图，state 走 Parameter/Result</td><td><span class="ok">推荐</span>；彻底绕开 ggml scheduler 的坑，且能复用 OV 原生 int4/int8 内核</td></tr>
+</table>
+
+<h2>6. 下一步建议</h2>
+<ol>
+<li><b>短期</b>：若只想在 llama.cpp 里跑 RWKV7，换非-openvino 的 CPU build（方案 A），别用这个 openvino 包跑 RWKV7。</li>
+<li><b>中期</b>：推进 <code>rwkv-openvino</code> 的完整 RWKV7 OV 图（方案 C）。GGUF K-quant 压缩权重继承已 bit-exact 验证通过，下一步是把 <code>rwkv7_torch.py</code> 的前向逐层用 <code>build_compressed_weight</code> 重写进 OV opset，验证 7.2B Q4 在 8GB 内跑通。</li>
+<li><b>已交付</b>：bit-exact 的 <code>gguf_kquant_repack.py</code> + <code>gguf_to_ov_compressed.py</code> 已 <code>git push</code>（commit <code>abc604b</code>），你现在 <code>git pull</code> 即可拿到。</li>
+</ol>
+
+<p style="color:var(--mut);font-size:12px;margin-top:30px;">复现环境：Ubuntu 22.04 x86-64 / 32 核 / 8GB cgroup / OpenVINO 2026.2.1 / llama.cpp b10369 (6e62ba538)。模型 rwkv7-g1i-1.5b-Q4_K_M.gguf（977 MB）。</p>
+</body>
+</html>

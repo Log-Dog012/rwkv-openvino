@@ -36,8 +36,9 @@ def build_compressed_weight(rep: dict, name: str):
     shape = rep["shape"]
     out_dim, in_dim = int(shape[0]), int(shape[1])  # RWKV 权重 [out, in]
     if tt in ("f16", "f32"):
-        dt = ov.Type.f16 if tt == "f16" else ov.Type.f32
-        const = ops.constant(np.ascontiguousarray(rep["data"].reshape(shape)), dt, name=f"{name}/w")
+        # 图统一 f16: 未量化权重也落 f16 常量 (与 torch 基线 fp16 推理一致)
+        const = ops.constant(np.ascontiguousarray(rep["data"].reshape(shape).astype(np.float16)),
+                             ov.Type.f16, name=f"{name}/w")
         return const
     codes = rep["codes"]
     scales = rep["scales"].astype(np.float32)
@@ -64,7 +65,10 @@ def build_compressed_weight(rep: dict, name: str):
         # gguf Q4_K 非对称: dequant = scale*code - min (min 不乘 scale).
         # OV 标准模式是 (code - zp)*scale, 故 zp 须用码空间零点 = min/scale,
         # 使 (code - min/scale)*scale = scale*code - min, 与 gguf 完全等价.
-        zp_eff = (rep["zp"].astype(np.float32) / scales).reshape(
+        # scale==0 的块(全零块, min 亦为 0)需规避除零 -> zp_eff=0 使结果=0, 不污染为 nan.
+        zp_raw = rep["zp"].astype(np.float32)
+        zp_eff = np.divide(zp_raw, scales, out=np.zeros_like(scales),
+                           where=scales != 0.0).reshape(
             out_dim, blocks_per_row, sub_n, 1).astype(np.float32)
         zp_const = ops.constant(np.ascontiguousarray(zp_eff), ov.Type.f16, name=f"{name}/zp")
         sub = ops.subtract(conv, zp_const, name=f"{name}/deq_sub")   # 广播 [..,1]
