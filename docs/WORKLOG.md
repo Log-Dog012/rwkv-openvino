@@ -103,11 +103,10 @@
 ## 5. 当前进行中 / 待办
 
 - [✅ 完成] **1.5B Q4 全 24 层分块生成**：16/16 token 与 torch 基线一致，峰值 <8GB（分块 + v_first/ln_out 修复后）。
-- [待办] **7.2B Q4**（4.58GB GGUF）分块构建/运行 <8GB（chunk=4，每块 ~1.8GB）。
-- [待办] **13.3B Q4**（8.46GB GGUF）导出 IR —— 仅交付物，compile/run 超 8GB 不做。
-- [可选] OV export 加 `ov::cache_dir` + `OPTIMIZE_SIZE` 缓存 IR（**注意**：本 OV 源码版 CPU 插件实测不支持 `cache_dir`，`compile_model` 直接报 NotFound；此路在源码版下走不通）。
-- [性能] 生成速度 ~17s/token（chunk 重载编译开销）；后续可研究常驻小 chunk + 其余用 IR 增量重载的折中。
-- [待查] 每编译层常驻 ~0.45GB（f16 精度/IR 文件编译均无改善）→ 疑似本 OV 源码版 CPU 插件**未真正融合 int4**、把权重解包成 f32 执行缓冲。若属实，将影响"原生 int4 速度"这一项目卖点，需用逐层计时验证。
+- [✅ 完成] **7.2B Q4 分块生成（L=32, C=4096, chunk=1, n=8）**：输出 `' Paris, France. It is situated on'`（连贯），峰值内存 ~6.8GB <8GB ✅；sweep 878s + 生成 826s（~103s/token，32 层每 token 全重载的代价）。前 4 token `[37138,45,44312,47]` 与 1.5B 相同（模型共识知识）。
+- [待办] **13.3B Q4**（8.46GB GGUF, L=61）导出 IR —— 仅交付物，compile/run 超 8GB 不做。
+- [参考工具] llama.cpp（/tmp/llama.cpp，已编 llama-cli，支持 rwkv7 arch）：因 RWKV7 chat 模板强制套用，`-no-cnv`/`--chat-template none` 均无法得到与 OV 可比的原始补全（套模板→"Okay, the user is..."，去模板→退化输出），**仅作参考不用于逐 token 比对**。
+- [性能] OV chunked 生成 ~103s/token（7.2B）/~17s/token（1.5B），瓶颈是每 token 全量重编译；llama.cpp 原生 4.2 t/s 对比悬殊 → 佐证"CPU 插件未融合 int4"的影响，值得专项排查。
 
 ---
 
