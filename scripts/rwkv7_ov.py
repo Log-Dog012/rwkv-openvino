@@ -259,6 +259,13 @@ def main():
 
     # 先落盘 IR（不依赖编译）：即便后续编译 OOM 也已保住产物，可换机/低内存方式编译
     if args.out:
+        # 文件级 fadvise: 丢弃 cgroup 页缓存里 GGUF 的文件页(旧进程残留), 给 save_model 腾出内存, 无需 root
+        try:
+            fd = os.open(args.gguf, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+        except Exception:
+            pass
         ov.save_model(model, args.out, compress_to_fp16=True)
         print(f"[ov] saved IR -> {args.out}")
 

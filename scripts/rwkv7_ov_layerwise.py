@@ -195,6 +195,8 @@ def main():
     A.add_argument("--threads", type=int, default=4)
     A.add_argument("--chunk", type=int, default=8, help="每分块层数(常驻内存 ~0.45GB/层, 8→~6.5GB 峰值)")
     A.add_argument("--ir-dir", default="/workspace/rwkv-openvino/temp/ir_chunks")
+    A.add_argument("--export-only", action="store_true",
+                   help="仅构建并落盘各 chunk IR(不编译不生成), 用于交付/超大模型导出")
     args = A.parse_args()
 
     t0 = time.time()
@@ -222,8 +224,38 @@ def main():
     except Exception:
         pass
 
+    def free_gguf_pages():
+        # mmap 级: 释放当前进程 fault 的 GGUF 页
+        try:
+            r.data.base.madvise(mmap.MADV_DONTNEED)
+        except Exception:
+            pass
+        # 文件级: 丢弃 cgroup 页缓存里该 GGUF 的所有文件页(旧进程残留也会清掉), 等效 drop_caches, 无需 root
+        try:
+            fd = os.open(args.gguf, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+        except Exception:
+            pass
+
     chunks = [(i, min(i + args.chunk, L)) for i in range(0, L, args.chunk)]
     os.makedirs(args.ir_dir, exist_ok=True)
+
+    if args.export_only:
+        # 仅构建+保存各 chunk IR（不编译不生成）——超大模型交付用
+        free_gguf_pages()   # 先清掉旧进程残留的 GGUF 页缓存, 避免 save_model 撞 8GB
+        for ci, (lo, hi) in enumerate(chunks):
+            path = f"{args.ir_dir}/chunk{lo}_{hi}.xml"
+            if os.path.exists(path):
+                print(f"[cw] export {ci+1}/{len(chunks)} chunk{lo}_{hi} exists, skip", flush=True)
+                continue
+            m, _ = build_chunk(r, lo, hi, V, C, with_head=(hi == L))
+            ov.save_model(m, path)
+            del m; gc.collect(); free_gguf_pages()
+            print(f"[cw] export {ci+1}/{len(chunks)} chunk{lo}_{hi} saved in {time.time()-t0:.1f}s", flush=True)
+        del r
+        print(f"[cw] export-only done: {len(chunks)} chunk IRs -> {args.ir_dir}", flush=True)
+        return
 
     def build_or_load(ci):
         """chunk ci: 有 IR 文件则直接 compile(快), 否则 build+save+compile。"""
@@ -267,12 +299,6 @@ def main():
         lg = np.array(req.get_output_tensor(0).data) if off == 1 else None
         del req
         return x_out, vf_out, lg
-
-    def free_gguf_pages():
-        try:
-            r.data.base.madvise(mmap.MADV_DONTNEED)
-        except Exception:
-            pass
 
     tok = TRIE_TOKENIZER_safe("rwkv_vocab_v20230424.txt")
     ids = tok.encode(args.prompt)
