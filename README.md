@@ -81,8 +81,10 @@ o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")
 > ⚠️ `float(64e-5)` 不能写成裸 `64e-5`：在 `import torch.nn as nn` 后 `64e-5` 会被解析为 `64 * nn - 5`（nn 是模块），导致虚假误差。
 
 ### 3. 量化权衡（NNCF W8A32 / W4）
-- **INT8_SYM（W8A32）**：无需校准集，直接压权重；0.1B 下体积 FP32 765MB → 193MB（4×），生成文本仍通顺。
-- **INT4_SYM（W4）**：NNCF 在 RWKV 的常量权重上**回退**（bitwidth 表空、体积与 INT8 相同），未真正压缩——这是 RWKV 权重多为固化常量的结果，不是配置问题。
+- **INT8_SYM（W8A32）**：无需校准集，直接压权重；0.1B 下体积 FP32 765MB → 193MB（3.96×），生成文本仍通顺。
+- **INT4_SYM（W4）—— 关键坑已解决**：NNCF `compress_weights` 默认 `group_size=128`，而 RWKV 大量矩阵通道维只有 **32/64**，整层被跳过/回退 → 看起来"没压缩"。改 `group_size=32`（或 64）后，**166/166 层全部 4-bit**，0.1B 体积 FP32 765MB → **153.8MB（4.97×）**，比 INT8 还小 ~20%，生成仍连贯（"…built in 1889…"）。`scripts/int4_demo.py` 已封装该修复。
+
+> ⚠️ 之前报告"INT4 未生效"是**测量 bug**（只量了 `.xml` 忘了 `.bin`）+ 默认 `group_size` 过大，并非 NNCF 不支持。
 
 ---
 
@@ -95,7 +97,7 @@ o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")
 | FP32 IR | 765 MB | 0.37 | ✓ 连贯 |
 | FP16 IR | 383 MB | 0.41 | ✓ 连贯 |
 | INT8_SYM | 193 MB | 13.3 | ✓ 通顺（"Paris…built in 1889"） |
-| INT4_SYM | 193 MB | — | 未真正压缩（NNCF 回退） |
+| INT4_SYM (gs=32) | 153.8 MB | — | ✓ 连贯（"…built in 1889 and is one of the most famous buildings"） |
 
 - **bit-exact**：`run_torch_baseline.py` 与官方 `rwkv==0.8.32`（`RWKV_V7_ON=1`）逐 token logits `max abs diff = 0.0`，`TEXT MATCH`。
 - **OV 推理正确**：FP32/FP16 跨框架 logits diff ~0.37/0.41（属正常 FP 误差），文本一致。
@@ -128,6 +130,7 @@ o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")
 | `scripts/rwkv_tokenizer.py` + `rwkv_vocab_v20230424.txt` | 纯 Python TRIE 分词器（从 rwkv 源码拷贝） |
 | `scripts/export_ov.py` | 0.1B 导出 FP32/FP16 IR 并自检 |
 | `scripts/quantize_ov.py` | NNCF INT8/INT4 权重量化对比 |
+| `scripts/int4_demo.py` | INT4_SYM 量化（修复 `group_size`）+ 体积/生成验证 |
 | `scripts/run_torch_baseline.py` | 与官方 rwkv 包 bit-exact 对比 |
 | `scripts/export_big.py` | 大模型参数化导出（--mode fp32/fp16 --load-fp16），torch↔OV 对照 |
 | `scripts/diag_*.py` | 定位 `F.group_norm` 转换偏差的单算子诊断 |
@@ -135,10 +138,10 @@ o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")
 ---
 
 ## 已知限制 / 后续
-- **OVMS 服务化**：本环境 github / docker.io / storage 均被墙，OVMS 二进制不可达。已给出 Docker 部署方案（见报吿），不在本机阻塞。
-- **INT4 未生效**：NNCF 在常量权重上回退，需后续探索 `nncf.quantize`（含激活量化）或 GPTQ/AWQ 预量化权重。
-- **GGUF 路线证伪**：BlinkDL 的 RWKV-7 权重无 GGUF/Q4 版本，`pth → 纯 torch → OV IR` 是唯一打通路径。
-- **内存天花板**：本沙箱 8 GB cgroup 限制了可导出模型上限（~0.4B）。更大模型需在 ≥16 GB / ≥32 GB 内存机器运行（命令已就绪）。
+- **OVMS 服务化**：OVMS 二进制（v2026.3.0，188MB）已通过 `ghp.keleyaa.com` 代理下载到 `temp/ovms/`，OV 后端版本与导出的 IR 同源兼容。本机启动 `ovms/bin/ovms` 尚待解决运行期依赖（库路径/模型加载），但部署路径已打通。
+- **INT4 已打通**：通过 `group_size=32`（见上文 3. 与 `int4_demo.py`），无需校准集即真正 4-bit。
+- **GGUF 路线**：RWKV-7 的 GGUF 权重主要在 modelscope（`shoumenchougou/RWKV7-G1i-{0.1B..13.3B}-GGUF`、`RemySkye/rwkv7-g1h-13.3b-i1-GGUF` 等）与 HF 镜像，本沙箱直连 HF 被墙；但本项目结论是 `pth → 纯 torch → OV IR` 路径已稳定跑通，GGUF 非必需。
+- **内存天花板**：本沙箱 8 GB cgroup 限制了可导出模型上限（实测 ~0.4B 稳进）。更大模型需在 ≥16 GB / ≥32 GB 内存机器运行（命令已就绪）。
 
 ---
 
