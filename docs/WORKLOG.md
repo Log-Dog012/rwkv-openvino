@@ -104,10 +104,10 @@
 
 - [✅ 完成] **1.5B Q4 全 24 层分块生成**：16/16 token 与 torch 基线一致，峰值 <8GB（分块 + v_first/ln_out 修复后）。
 - [✅ 完成] **7.2B Q4 分块生成（L=32, C=4096, chunk=1, n=8）**：输出 `' Paris, France. It is situated on'`（连贯），峰值内存 ~6.8GB <8GB ✅；sweep 878s + 生成 826s（~103s/token，32 层每 token 全重载的代价）。前 4 token `[37138,45,44312,47]` 与 1.5B 相同（模型共识知识）。
-- [🔄 进行中] **ModelScope 交付**（`logdog/` 命名空间，已登录）：
-  - `rwkv7-g1i-1.5b-q4k-ov`：单图 IR（xml+bin）✅ 完整上传
-  - `rwkv7-g1i-7.2b-q4k-ov`：chunk IR xml ✅ + bin ⚠️ 待补传
-  - `rwkv7-g1i-13.3b-q4k-ov`：chunk IR xml ✅ + bin ⚠️ 待补传
+- [✅ 完成] **ModelScope 交付**（`logdog/` 命名空间，已登录）：
+  - `logdog/rwkv7-g1i-1.5b-q4k-ov`：单图 IR（xml+bin+README）✅
+  - `logdog/rwkv7-g1i-7.2b-q4k-ov`：32 chunk IR（xml+bin+README）✅
+  - `logdog/rwkv7-g1i-13.3b-q4k-ov`：61 chunk IR（xml+bin+README）✅
 - [⚠️ 教训] `modelscope upload` 只传指定文件，**不会自动带上同名的 .bin**——分块上传必须 xml 与 bin 都显式传（首轮只传了 xml，远端缺权重，需补传）。
 - [⚠️ 教训] 沙箱**磁盘配额 ~51GB**（df 显示 205GB 可用是假象）：大文件写入超配额报 `Disk quota exceeded`；OV `ov.save_model` 撞配额时报 `basic_ios::clear: iostream error`（误判为内存问题花了很久）。对策：`dd` 测写定位、及时清理已上传 IR、串行导出。
 - [待办] **13.3B Q4 IR 交付**：61 chunk IR 已导出并上传 xml，补传 bin 后完成。
