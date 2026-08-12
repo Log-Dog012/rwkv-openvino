@@ -139,6 +139,7 @@ def main():
     A.add_argument("--n", type=int, default=16)
     A.add_argument("--threads", type=int, default=4)
     A.add_argument("--layers", type=int, default=0, help="仅前 N 层(0=全部)")
+    A.add_argument("--cache", default=None, help="OV 编译缓存目录: 每层编译产物落盘, 中断/重跑时已编译层秒级恢复")
     args = A.parse_args()
 
     t0 = time.time()
@@ -171,6 +172,12 @@ def main():
             pass
 
     core = ov.Core()
+    if args.cache:
+        try:
+            core.set_property("cache_dir", args.cache)
+            print(f"[lw] OV cache_dir -> {args.cache} (层编译产物落盘, 可断点续跑)", flush=True)
+        except Exception as e:
+            print(f"[lw] WARN cache_dir 设置失败: {e}", flush=True)
     try:
         core.set_property("CPU", {ov.properties.inference_num_threads: args.threads,
                                   ov.properties.hint.performance_mode: ov.properties.hint.PerformanceMode.LATENCY})
