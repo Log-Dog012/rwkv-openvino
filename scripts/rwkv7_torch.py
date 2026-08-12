@@ -25,21 +25,38 @@ class RWKV7(nn.Module):
         super().__init__()
         raw = torch.load(path, map_location="cpu", mmap=True)
         assert not any("s_emb" in k for k in raw), "DeepEmbed 变体暂不支持"
-
         self.n_head, self.head_size = raw["blocks.0.att.r_k"].shape
-        self.vocab_size, self.n_embd = raw["emb.weight"].shape
-        self.n_layer = max(int(k.split(".")[1]) for k in raw if k.startswith("blocks.")) + 1
-        self.dtype = dtype
+        self._build_from_raw(raw, dtype)
 
-        z = {}
-        for k, v in raw.items():
-            t = v
-            if any(s in k for s in _T_KEYS):
-                t = t.t()          # 官方装载时把这几类矩阵转置，forward 里用 x @ W
-            t = t.squeeze()        # (1,1,C) -> (C,)
-            if k.endswith("att.r_k"):
-                t = t.flatten()    # (H,N) -> (H*N,)
-            z[k] = t.to(dtype).contiguous()
+    @classmethod
+    def from_state(cls, z, n_head, head_size, dtype=torch.float32):
+        """从"已后处理"的权重 dict 构建（值 = 官方 loader 变换后的 tensor），
+        用于 GGUF 反量化注入等非 pth 来源。z 的键格式同 pth（blocks.i.att.xxx），
+        值应为 squeeze/flatten/转置后的 torch tensor。"""
+        obj = cls.__new__(cls)
+        nn.Module.__init__(obj)  # __new__ 绕过 Module.__init__，需手动初始化以便 register_buffer
+        obj.n_head, obj.head_size = n_head, head_size
+        obj._build_from_raw(z, dtype, already_processed=True)
+        return obj
+
+    def _build_from_raw(self, raw, dtype, already_processed=False):
+        self.dtype = dtype
+        if already_processed:
+            z = dict(raw)  # 已后处理：不再做转置/squeeze/flatten
+            self.vocab_size, self.n_embd = z["emb.weight"].shape
+            self.n_layer = max(int(k.split(".")[1]) for k in z if k.startswith("blocks.")) + 1
+        else:
+            self.vocab_size, self.n_embd = raw["emb.weight"].shape
+            self.n_layer = max(int(k.split(".")[1]) for k in raw if k.startswith("blocks.")) + 1
+            z = {}
+            for k, v in raw.items():
+                t = v
+                if any(s in k for s in _T_KEYS):
+                    t = t.t()          # 官方装载时把这几类矩阵转置，forward 里用 x @ W
+                t = t.squeeze()        # (1,1,C) -> (C,)
+                if k.endswith("att.r_k"):
+                    t = t.flatten()    # (H,N) -> (H*N,)
+                z[k] = t.to(dtype).contiguous()
 
         # emb 预先做 ln0，省掉每步一次 layer_norm
         z["emb.weight"] = F.layer_norm(

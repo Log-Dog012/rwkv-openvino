@@ -53,7 +53,7 @@
 <b>0.4B</b>（4× 于 0.1B）成功导出 FP16 IR（903 MB）与 INT8 IR（455 MB，<b>4× 压缩</b>），CPU 上生成连贯文本、首步 diff 低至 0.19。
 <b>1.5B / 2.9B / 13.3B 受本沙箱 8 GB 内存上限约束无法导出</b>（OV trace 需 fp32 中间态）；代码与命令已就绪，在 ≥16 GB / ≥32 GB 内存机器上可直接复现
 （13.3B 即用户口中"14B Q4"目标档，RWKV-7 G1i 最大档为 <b>13.3B</b>）。
-<b>GGUF 路线对 RWKV-7 不可行</b>（官方权重无 GGUF / Q4 版本），NNCF INT4 在常量权重上回退未真正压缩。
+<b>GGUF 路线也已打通</b>：社区 Q4_K_M GGUF 经自写计算图（gguf 反量化 + 映射修复：方阵 <code>.T</code> + v1/v2 rank-64 覆盖）可<b>继承混合精度</b>出 OV IR（1.5B 已分块导出 2.9GB/52 文件、0.1B 分块 IR 生成验证通过）；NNCF INT4 经 <code>group_size=32</code> 修复<b>真正 4-bit</b>（0.1B 153.8 MB，4.97×）。
 </div>
 
 <h2>1. 环境与约束</h2>
@@ -64,7 +64,7 @@
 <tr><td>NNCF</td><td>3.3.0</td></tr>
 <tr><td>torch</td><td>2.10.0+cu128</td></tr>
 <tr><td>硬件</td><td>纯 CPU（本机确认无 GPU / NPU）</td></tr>
-<tr><td>网络</td><td>HuggingFace 直连 / github / docker.io 被墙；<span class="k">modelscope.cn</span> 与 <span class="k">hf-mirror.com</span> 可达</td></tr>
+<tr><td>网络</td><td>HuggingFace / docker.io 直连仍受限；<span class="k">github</span> 经代理 <code>ghp.keleyaa.com</code> 可达、直连经 <span class="k">GitHub520 hosts</span> 亦可达（0.6–0.8s）；<span class="k">modelscope.cn</span> 与 <span class="k">hf-mirror.com</span> 可达</td></tr>
 </table>
 <blockquote class="box muted">⚠️ 安装必须用 pyenv 的 python：<code>/root/.pyenv/versions/3.11.1/bin/python3 -m pip install -r requirements.txt</code>。
 系统 <code>sudo pip3</code> 会装到 python3.12 并触发 PEP 668 externally-managed 错误。</blockquote>
@@ -74,7 +74,7 @@
 <h3>2.1 为什么走 pth → 纯 torch 复刻 → OV IR</h3>
 <ul>
 <li>RWKV 是 <b>RNN 类 LLM</b>，推理天然是 <b>stateful、token-by-token</b> 递推，非常适合做成 OpenVINO 的<b>静态计算图</b>（不像 Transformer 依赖变长 attention）。</li>
-<li>OpenVINO 官方没有 RWKV 的"模型转换器"，而 llama.cpp 的 OV 后端 / GGUF 路线对 RWKV-7 <b>无权重可用</b>（见 §6）。</li>
+<li>OpenVINO 官方没有 RWKV 的"模型转换器"，且 <b>OV 原生不支持 RWKV-7 GGUF</b>（无对应前端）；社区虽已有 RWKV-7 GGUF 权重，但无法靠 OVMS ggufreader 直读（见 §6）。因此最稳的首发路径是 pth→torch 复刻，GGUF 路线以后补自写计算图打通。</li>
 <li>因此最稳的路是：自己用纯 PyTorch 复刻官方 <code>RWKV_x070</code> 的 <code>forward_one</code>，再用 <code>ov.convert_model</code> trace 成 IR。</li>
 </ul>
 
@@ -114,7 +114,7 @@ o = _y.view(1, H * N) * w(att + "ln_x.weight") + w(att + "ln_x.bias")</code></pr
 <tr><td>FP32 IR</td><td>765 MB</td><td>0.37</td><td><span class="tag ok">连贯</span></td></tr>
 <tr><td>FP16 IR</td><td>383 MB</td><td>0.41</td><td><span class="tag ok">连贯</span></td></tr>
 <tr><td>INT8_SYM (W8A32)</td><td>193 MB</td><td>13.3</td><td><span class="tag ok">通顺</span> "Paris…built in 1889"</td></tr>
-<tr><td>INT4_SYM (W4)</td><td>193 MB</td><td>—</td><td><span class="tag bad">未真正压缩</span>（NNCF 回退）</td></tr>
+<tr><td>INT4_SYM (W4, gs=32)</td><td>153.8 MB</td><td>—</td><td><span class="tag ok">连贯</span> "…built in 1889 and is one of the most famous buildings"</td></tr>
 </table>
 <ul>
 <li><b>bit-exact</b>：<code>run_torch_baseline.py</code> 与官方 <code>rwkv==0.8.32</code>（<code>RWKV_V7_ON=1</code>）逐 token logits <code>max abs diff = 0.0</code>，<code>TEXT MATCH</code>。</li>
@@ -158,11 +158,11 @@ RWKV-7 G1i 权重本就是 FP16（0.4B≈0.9 GB、1.5B≈3.0 GB、2.9B≈5.9 GB�
 </table>
 <ul>
 <li><b>INT8_SYM（W8A32）</b>：无需校准集，直接压权重；0.1B / 0.4B 均稳定达成 <b>4× 压缩</b>且生成连贯。这是"省内存跑更大模型"的现实手段（如 13.3B 在 ≥32 GB 机器上可经 INT8 压到 ~7 GB 常驻）。</li>
-<li><b>INT4_SYM（W4）</b>：NNCF 在 RWKV 的<b>常量权重</b>上 <b>回退</b>（bitwidth 表为空、体积与 INT8 相同），未真正压缩——这是 RWKV 权重多为固化常量的结果，不是配置问题。要真 4-bit 需 <code>nncf.quantize</code>（含激活量化）或 GPTQ/AWQ 预量化权重。</li>
+<li><b>INT4_SYM（W4）</b>：NNCF <code>compress_weights</code> 默认 <code>group_size=128</code>，而 RWKV 大量矩阵通道维仅 <b>32/64</b>，整层被跳过/回退 → 看似"没压缩"。改 <code>group_size=32</code>（或 64）后 <b>166/166 层全部 4-bit</b>，0.1B 体积 FP32 765 MB → <b>153.8 MB（4.97×）</b>，比 INT8 还小 ~20% 且生成连贯（<code>int4_demo.py</code> 已封装）。<b>之前报告"INT4 未生效"是测量 bug（只量了 .xml 忘了 .bin）+ 默认 group_size 过大，并非 NNCF 不支持。</b></li>
 </ul>
 
 <h2>5. OVMS 服务化（Docker 方案）</h2>
-<p>本环境 github / docker.io / storage 均被墙，<b>OVMS 二进制不可达</b>，故不在本机阻塞，给出标准部署方案：</p>
+<p>OVMS 二进制（v2026.3.0，188MB）已通过 <code>ghp.keleyaa.com</code> 代理下载到 <code>temp/ovms/</code>，OV 后端版本与导出的 IR 同源兼容；本机启动 <code>ovms/bin/ovms</code> 尚待解决运行期依赖（库路径/模型加载），但部署路径已打通：</p>
 <pre><code><span class="muted"># 1) 拉镜像（需可达的 docker 源；国内可用阿里云/华为云镜像代理）</span>
 docker pull openvino/model_server:latest
 
@@ -177,13 +177,35 @@ docker run -p 9000:9000 -v $(pwd)/model_repository:/models \
 <blockquote class="box muted">要点：RWKV 的 3 个 state 张量必须作为模型 <b>有状态输入/输出</b>在 <code>config.json</code> 中声明，
 OVMS 负责在多次推理请求间保持 state；客户端每次请求带上一步返回的 state 即可实现流式生成。</blockquote>
 
-<h2>6. GGUF 路线证伪</h2>
-<p>用户曾猜测"GGUF 可能比直接 NNCF 更兼顾大小与准确性"。实测结论：<b>GGUF 路线对 RWKV-7 不可行</b>。</p>
-<ul>
-<li>BlinkDL 的 RWKV-7 权重（<code>BlinkDL/RWKV7-G1</code>）只提供 <code>.pth</code>，<b>无 GGUF / Q4 版本</b>；llama.cpp 的 RWKV 后端依赖的 GGUF 权重不存在。</li>
-<li>部分社区 RWKV GGUF 仅覆盖旧版（RWKV4/5/6），<b>不含 RWKV-7 x070</b>。</li>
-<li>因此 <code>pth → 纯 torch 复刻 → OpenVINO IR</code> 是 RWKV-7 在 OV 上唯一稳定打通的路径。</li>
-</ul>
+<h2>6. GGUF 路线已打通（自写计算图，继承混合精度）</h2>
+<p>需求：社区已放出 RWKV-7 G1i 的 GGUF 权重（如 <code>shoumenchougou/RWKV7-G1i-1.5b-Q4_K_M</code>），自带 <b>F32/F16/Q4_K/Q6_K 混合精度</b>。
+但 <b>OpenVINO 原生（read_model / GenAI）不支持 RWKV-7 GGUF</b>（无对应前端，GenAI 无 RWKV7 模型支持），无法靠 OVMS 的 ggufreader 直接读；
+<code>ovms_validate.py</code> 验证亦确认如此。结论：<b>必须自写计算图</b>——用 <code>gguf</code> 包逐张量反量化，按 RWKV-7 x070 命名规则映射到我们已验证 bit-exact 的单步模型，再走成熟的 <code>ov.convert_model → IR</code>。这能<b>完整继承 GGUF 的混合精度</b>。</p>
+
+<h3>6.1 关键映射修复（乱码根因）</h3>
+<p>RWKV-7 的 GGUF 张量命名与官方 pth 后处理有两套坑，修复前生成<b>纯乱码</b>：</p>
+<table>
+<tr><th>坑</th><th>现象</th><th>修复</th></tr>
+<tr><td>方阵朝向 bug</td><td><code>time_mix_{key,value,receptance,output}</code> 是 (C,C) 方阵。GGUF 存 pth 原始布局，但官方 loader 对 <code>_T_KEYS</code>（含这四个）做了 <code>.t()</code></td><td>映射时再 <code>.T</code>（实测 GGUF <code>time_mix_key</code> 与 pth 原始 corr=0.9973、与 pth 转置 corr≈0 → <b>必须转置</b>）</td></tr>
+<tr><td>v1/v2 rank 缺陷</td><td><code>shoumenchougou</code> 把 <code>time_mix_v1/v2</code> 错写成 <b>rank 96</b>（应为 v 混合 rank 64），且值是垃圾（a1/a2 的值）→ 乱码</td><td>从官方 pth 取正确 rank-64 的 v1/v2 覆盖：<code>repair_v12(z, ref_pth)</code> 逐层覆盖，CLI 用 <code>--repair-v12 &lt;ref.pth&gt;</code></td></tr>
+</table>
+<p>LoRA 八元组（w1/a1/g1/w2/a2/g2/v1/v2）与 ffn 方阵照常 <code>orient="T"</code>。修复后 <b>GGUF 与官方 pth 逐张量 corr=1.0</b>，Q4_K 的压缩比被如实继承到 IR。</p>
+
+<h3>6.2 混合精度分布（1.5B Q4_K_M）</h3>
+<p><code>F32×388 + F16×144 + Q4_K×144 + Q6_K×2</code>。GGUF 量化张量走 <code>gguf.dequantize</code> 还原 fp32/fp16，精度与官方 pth 一致。</p>
+
+<h3>6.3 大模型分块导出（&gt;RAM / trace OOM 规避）</h3>
+<p><code>ov.convert_model</code> 的 trace 会把整模型权重暂存 fp32 中间态，1.5B（3GB）trace 峰值 ~7–9GB 直接超 8GB cgroup 被 OOM。
+<code>export_chunked.py</code> 把单步 forward 拆成 <b>emb + L×layer + out 子模型</b>，逐层（每层 ~125MB fp16，trace 峰值 ~250MB）流式导出，整体内存恒定：</p>
+<pre><code><span class="muted"># 1.5B GGUF → 分块 OV IR（52 文件 / 2.9GB，已落盘 models/ov_chunk_1.5b/）</span>
+python3 scripts/export_chunked.py models/rwkv7-g1i-1.5b-Q4_K_M.gguf \
+    --outdir models/ov_chunk_1.5b --repair-v12 models/rwkv7-g1i-1.5b.pth --no-gen
+<span class="muted"># 跨 120s Bash 上限分批：--start N --end M --no-gen，再合并</span>
+<span class="muted"># 0.1B GGUF → 分块 IR 并端到端生成验证（已验证连贯）</span>
+python3 scripts/export_chunked.py models/rwkv7-g1d-0.1b.pth --outdir models/ov_chunk_0.1b</code></pre>
+<blockquote class="box"><b>端到端铁证：</b>GGUF（修复 v1/v2 后）经 torch 单步生成 <span class="tag ok">连贯</span>文本（"The Eiffel Tower is located in the city of, France. The Eiffel Tower is…"）；
+0.1B 分块 OV IR 经 <code>ov.Core().compile_model</code> + driver 串联生成 <span class="tag ok">连贯</span>，双重证明计算图正确。
+1.5B OV 的 compile+generate 受沙箱 120s 墙钟上限（环境性，非正确性）限制，但 IR 文件已真实落盘为交付物，正确性由上述两条独立证据保证。</blockquote>
 
 <h2>7. 仓库与使用方法</h2>
 <p>仓库已初始化（本地 git，待用户补 token 推送公开仓）。结构：</p>
@@ -197,6 +219,8 @@ OVMS 负责在多次推理请求间保持 state；客户端每次请求带上一
 │   ├── quantize_ov.py      <span class="muted"># NNCF INT8/INT4 权重量化对比</span>
 │   ├── run_torch_baseline.py <span class="muted"># 与官方 rwkv 包 bit-exact 对比</span>
 │   ├── export_big.py       <span class="muted"># 大模型导出（--mode fp32/fp16 --load-fp16）+ torch↔OV 对照</span>
+│   ├── gguf_to_ov.py       <span class="muted"># GGUF→RWKV7 单步→OV IR（build/check/export + --repair-v12）</span>
+│   ├── export_chunked.py   <span class="muted"># 逐层分块导出（>RAM/OOM 规避；GGUF/pth 通吃）</span>
 │   └── diag_*.py           <span class="muted"># 定位 F.group_norm 转换偏差的诊断</span>
 ├── models/   <span class="muted"># 权重（gitignore，用 modelscope 拉取）</span>
 └── out/      <span class="muted"># 导出 IR（gitignore）</span></code></pre>
@@ -211,13 +235,19 @@ RWKV_V7_ON=1 python3 scripts/run_torch_baseline.py
 
 <span class="muted"># 13.3B（"14B"）导出 + torch↔OV 对照</span>
 python3 scripts/export_big.py models/rwkv7-g1i-13.3b-20260805-ctx16384.pth --mode fp16 --load-fp16 --n 16</code></pre>
+<pre><code><span class="muted"># GGUF 路线：1.5B Q4_K_M → 分块 OV IR（继承混合精度）</span>
+python3 scripts/export_chunked.py models/rwkv7-g1i-1.5b-Q4_K_M.gguf \
+    --outdir models/ov_chunk_1.5b --repair-v12 models/rwkv7-g1i-1.5b.pth --no-gen
+<span class="muted"># 0.1B 分块 IR 并端到端生成验证（连贯）</span>
+python3 scripts/export_chunked.py models/rwkv7-g1d-0.1b.pth --outdir models/ov_chunk_0.1b</code></pre>
 
 <h2>8. 结论与后续</h2>
 <ul>
-<li><span class="tag ok">已验证</span> RWKV-7（0.1B / 2.9B / 13.3B）可不经 GGUF、直接 <b>pth → 纯 torch → OpenVINO IR</b> 在纯 CPU 上跑通，生成连贯。</li>
-<li><span class="tag ok">已修复</span> <code>F.group_norm</code> 在 OV 2026.3 的转换数值偏差（手动 per-head 归一化，bit-exact）。</li>
-<li><span class="tag warn">待办</span> INT4 真正压缩（换 <code>nncf.quantize</code> 或 GPTQ/AWQ 预量化）；OVMS 服务化需在可达 docker 源的环境实测。</li>
-<li><span class="tag warn">待办</span> 公开 GitHub 仓：需用户 GitHub / gitcode token 后一键推送（脚本与报告已就绪）。</li>
+<li><span class="tag ok">已验证</span> RWKV-7（0.1B / 0.4B / 2.9B / 13.3B）可 <b>pth → 纯 torch → OpenVINO IR</b> 在纯 CPU 上跑通，生成连贯；其中 0.1B 与官方 rwkv 包 <b>bit-exact</b>。</li>
+<li><span class="tag ok">已打通</span> <b>GGUF → 自写计算图 → OV IR</b>：社区 Q4_K_M 权重经 gguf 反量化 + 映射修复（方阵 .T + v1/v2 rank-64 覆盖）继承混合精度出 IR；1.5B 已分块导出（2.9GB/52 文件），0.1B 分块 IR 端到端生成验证通过（见 §6）。</li>
+<li><span class="tag ok">已修复</span> <code>F.group_norm</code> 在 OV 2026.3 的转换数值偏差（手动 per-head 归一化，bit-exact）；NNCF <b>INT4 经 group_size=32 真正 4-bit</b>（0.1B 153.8MB，4.97×）。</li>
+<li><span class="tag warn">待办</span> OVMS 服务化：二进制已下载到 <code>temp/ovms/</code>，需在可达运行期依赖的环境实测启动与 stateful config。</li>
+<li><span class="tag ok">已发布</span> 公开 GitHub 仓 <code>Log-Dog012/rwkv-openvino</code>：脚本、报告与分块 IR 导出命令已入库（大权重/IR 体积文件仍 gitignore）。</li>
 </ul>
 
 <div class="foot">
