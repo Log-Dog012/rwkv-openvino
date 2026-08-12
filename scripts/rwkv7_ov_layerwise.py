@@ -173,15 +173,32 @@ def main():
     core = ov.Core()
     try:
         core.set_property("CPU", {ov.properties.inference_num_threads: args.threads,
-                                  ov.properties.hint.performance_mode: ov.properties.hint.PerformanceMode.LATENCY})
+                                  ov.properties.hint.performance_mode: ov.properties.hint.PerformanceMode.LATENCY,
+                                  ov.properties.hint.inference_precision: ov.properties.hint.precision.f16})
     except Exception:
         pass
-    comps, reqs = [], []
+    comps = []
+    IR_DIR = "/workspace/rwkv-openvino/temp/ir_layers"
+    os.makedirs(IR_DIR, exist_ok=True)
+    def _mem():
+        try:
+            with open("/sys/fs/cgroup/memory.current") as f:
+                return int(f.read()) / 1e9
+        except Exception:
+            return -1.0
     for li in range(L):
+        if li >= 13:
+            print(f"[lw] li={li} pre-build mem={_mem():.2f}GB", flush=True)
         m, _ = build_layer(r, li, V, C, with_head=(li == L - 1))
-        comp = core.compile_model(m, "CPU")
-        comps.append(comp); reqs.append(comp.create_infer_request())
+        # 先落盘 IR 再 del, 从文件编译: 消除源图在 Python 侧的二次保留
+        ir_path = f"{IR_DIR}/l{li}.xml"
+        ov.save_model(m, ir_path)
         del m
+        gc.collect()
+        if li >= 13:
+            print(f"[lw] li={li} pre-compile mem={_mem():.2f}GB", flush=True)
+        comp = core.compile_model(ir_path, "CPU")
+        comps.append(comp)                       # 只保留编译模型; InferRequest 现建现删(省 ~0.25GB/层)
         gc.collect()
         release_gguf_pages()   # 释放本层 fault 的 GGUF 文件页
         if (li + 1) % 8 == 0 or li == L - 1:
@@ -202,19 +219,21 @@ def main():
     s_ffn = np.zeros((L, C), np.float16)
 
     def run_token(t):
-        """跑完所有层(逐层推进状态), 返回末层 logits[V]。"""
+        """跑完所有层(逐层推进状态), 返回末层 logits[V]。InferRequest 逐层现建现删, 控制常驻内存。"""
         for li in range(L):
-            reqs[li].infer({"idx": np.array([t], np.int64), "emb_table": emb_ln,
-                            "s_att_x": s_att[li:li + 1], "s_kv": s_kv[li:li + 1], "s_ffn": s_ffn[li:li + 1]})
+            req = comps[li].create_infer_request()
+            req.infer({"idx": np.array([t], np.int64), "emb_table": emb_ln,
+                       "s_att_x": s_att[li:li + 1], "s_kv": s_kv[li:li + 1], "s_ffn": s_ffn[li:li + 1]})
             if li == L - 1:
-                logits = np.array(reqs[li].get_output_tensor(0).data)
-                att = np.array(reqs[li].get_output_tensor(1).data)
-                kv = np.array(reqs[li].get_output_tensor(2).data)
-                ffn = np.array(reqs[li].get_output_tensor(3).data)
+                logits = np.array(req.get_output_tensor(0).data)
+                att = np.array(req.get_output_tensor(1).data)
+                kv = np.array(req.get_output_tensor(2).data)
+                ffn = np.array(req.get_output_tensor(3).data)
             else:
-                att = np.array(reqs[li].get_output_tensor(0).data)
-                kv = np.array(reqs[li].get_output_tensor(1).data)
-                ffn = np.array(reqs[li].get_output_tensor(2).data)
+                att = np.array(req.get_output_tensor(0).data)
+                kv = np.array(req.get_output_tensor(1).data)
+                ffn = np.array(req.get_output_tensor(2).data)
+            del req
             s_att[li] = att.astype(np.float16); s_kv[li] = kv.astype(np.float16); s_ffn[li] = ffn.astype(np.float16)
         return logits
 
