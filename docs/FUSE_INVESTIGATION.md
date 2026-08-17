@@ -140,3 +140,15 @@ L=16 的 perf counter：**耗时大头是 FFN matmul（ffk/ffv，16384×4096）�
 2. **改 IR 输入命名适配 GenAI**：把 `idx/s_att_x/s_kv/s_ffn` 重命名为 GenAI 期望的 `input_ids/attention_mask/present.*`（需要把 RNN 状态伪装成 KV cache，GenAI 的采样器才能工作）——可行性待验证，风险高
 
 **项目定位**：我们的 IR 对标 llamacpp ov 后端产物（bin+xml 标准格式，可被 ov Core read_model / GenAI 加载），驱动层自写 pipeline（超越 llamacpp ov 后端的点：llamacpp ov 后端连加载 RWKV 都崩 CPY，我们至少 IR 全链路可用）。
+
+### 8.3 自写 pipeline 落地（`scripts/genai_style_pipeline.py`）
+
+**方案**（§8.2 出路 1 的实现）：GenAI 风格接口 + 分块执行器驱动 + tokenizer IR 编解码，不依赖 GenAI 的 StatefulLLMPipeline。
+
+- **接口**：`RWKVPipeline(gguf, ir_dir, tokenizer_xml, detokenizer_xml).generate(prompt, max_new_tokens) -> str`（对标 openvino_genai.LLMPipeline）
+- **tokenizer 层**：`openvino_tokenizers.build_rwkv_tokenizer` 转出的 IR，`ov::InferRequest` 驱动 encode/decode——验证与仓库 TRIE_TOKENIZER 编解码 **4 测试串全一致**（含中文）✅
+- **模型层**：分块执行器语义（chunk IR 链式 `_full_pass`，states `[L,C]/[L,H,N,N]/[L,C]` 持久累积，绕开单图 FFN 退化）
+- **端到端冒烟**：13.3b 短 prompt，pipeline ready（6.6s）→ encode → prompt sweep（201s，8 chunk 推理）→ 全链路无崩 ✅；生成阶段逻辑与已验证的分块执行器一致（13.3b 曾产出 ' Paris, France'）
+- **踩坑**：①参数名 `gguf` 遮蔽 `import gguf` 模块（改名 `gguf_path`）②`_ir_dir` 未存实例 ③`_full_pass` 需链式 x_in/vf_in 传递（非 stream 数组）④tokenizer IR compile 需 `import openvino_tokenizers` 注册 TrieTokenizer 扩展
+
+**易用性闭环达成**：我们的 IR（bin+xml）+ 官方 tokenizer IR + 自写 pipeline = 完整可用的「GGUF→OVIR→生成」链路，对标 llamacpp ov 后端（其连 RWKV 加载都崩 CPY）。
