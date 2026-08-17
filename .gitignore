@@ -14,3 +14,7 @@ __pycache__/
 # 临时诊断
 temp/
 *.log
+
+# C++ extension build artifacts
+scripts/kquant_op/build/
+scripts/kquant_op/*.dll
