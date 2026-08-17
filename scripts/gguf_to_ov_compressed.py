@@ -45,6 +45,9 @@ def build_compressed_weight(rep: dict, name: str):
     # block 布局 (blk_elems 每 block 元素数; sub_n×sub_e 子块划分, 一组 scale 覆盖 sub_e 元素)
     if gtt == "Q4_K":
         blk_elems, sub_n, sub_e, code_dtype = 256, 8, 32, ov.Type.u4
+    elif gtt == "Q5_K":
+        # 5-bit 值(0-31)存 i8 容器, 8 组×32 元素, 非对称(有 zp) — 同 Q4_K 结构
+        blk_elems, sub_n, sub_e, code_dtype = 256, 8, 32, ov.Type.i8
     elif gtt == "Q6_K":
         blk_elems, sub_n, sub_e, code_dtype = 256, 16, 16, ov.Type.i8
     elif gtt == "Q8_0":

@@ -111,3 +111,32 @@ L=16 的 perf counter：**耗时大头是 FFN matmul（ffk/ffv，16384×4096）�
 | **可部署**（HF 发布 IR） | 1.5b/7.2b/13.3b 已上传 ModelScope | — | 保持 |
 
 **关键结论**：当前 OV 2026.3 的 CPU 插件对「61 层整图 FFN matmul」有不可调的退化（渐进超线性 + 无可调属性），单图常驻不可行。**分块执行器是唯一可行路径**（绕开退化 + 内存墙）。速度上追平 llamacpp 的路线：等 OV 上游修整图退化，或自定义 op 强制 int4 处理 FFN 大 matmul（预期收益有限，单 matmul 融合已快）。易用性路线：补 eos 元数据 + tokenizer IR 让 GenAI 直接驱动我们的 IR。
+
+---
+
+## 八、Q5_K 支持 + 易用性补齐（task 6 轮）
+
+### 8.1 Q5_K repack 支持（参考 llamacpp ov 后端，目标超越）
+
+- **llamacpp ov 后端映射**（`ggml-openvino-extra.cpp` `get_extracted_layout`）：Q5_K → `is_u4=false`（**u8 容器**）、`weights_per_block=32`、`is_symmetric=false`（非对称 scale+zp）——与 Q4_K 同结构，容器 u8
+- **我们的实现**（`gguf_kquant_repack.py` `repack_q5_k`）：向量化，block=256 元素/176B（2B d + 2B dmin + 12B scales + 32B qh + 128B qs），解码 `ql(4bit) | qh(1bit)<<4`（5-bit 值 0-31），8 组 × 32 元素非对称
+- **接入**：`repack_tensor` 加 Q5_K 分支（type=i8），`build_compressed_weight` 加 Q5_K 分支（`256, 8, 32, ov.Type.i8`）
+- **验证**：STEP1 还原 vs gguf 官方解码 **err=0.0**（bit-exact）✅；OV 压缩权重子图 matmul（合理 scale 数据）**err=3e-5** ✅
+- **覆盖对比**：Q4_K/Q6_K/Q8_0/Q5_K 全覆盖 = llamacpp ov 后端支持的全部 K-quant 类型（Q3_K/Q2_K 两边都不支持）
+
+### 8.2 易用性路径实测（GenAI 直接驱动我们的 IR）
+
+| 步骤 | 做法 | 结果 |
+|---|---|---|
+| eos 元数据 | 模型目录放 `generation_config.json`（`{"eos_token_id": 0}`） | ✅ GenAI 读取成功，`stop_token_ids=-1` 报错消除 |
+| tokenizer IR | `openvino_tokenizers.build_rwkv_tokenizer`（官方支持 RWKV vocab v20230424，正是我们的 vocab）转出 `openvino_tokenizer.xml/detokenizer.xml` | ✅ encode/decode 往返正确（'Hello world' → [[33155 40213]] → 'Hello world'） |
+| 端到端加载 | 目录含 `openvino_model.xml/bin + generation_config.json + tokenizer/detokenizer IR` | ✅ **PIPE OK**（GenAI 完整加载我们的 IR） |
+| 端到端 generate | `pipe.generate('Hello')` | ❌ 报 `attention_mask` 缺失 |
+
+**易用性边界结论**：GenAI `StatefulLLMPipeline` 按 **transformer KV cache 约定**驱动（`input_ids/attention_mask/present.*`），RWKV 的 RNN 状态输入（`idx/s_att_x/s_kv/s_ffn`）不匹配——**bin+xml 能被 GenAI 加载（read_model 层通用），但不能被 LLMPipeline 直接驱动生成**。
+
+**出路（二选一）**：
+1. **自写 pipeline**（推荐）：用 `ov::InferRequest` 直接驱动我们的 stateful IR（本仓库分块执行器就是），GenAI 的 LLMPipeline 只借 tokenizer IR 层——「bin+xml 通用 + 自写驱动」
+2. **改 IR 输入命名适配 GenAI**：把 `idx/s_att_x/s_kv/s_ffn` 重命名为 GenAI 期望的 `input_ids/attention_mask/present.*`（需要把 RNN 状态伪装成 KV cache，GenAI 的采样器才能工作）——可行性待验证，风险高
+
+**项目定位**：我们的 IR 对标 llamacpp ov 后端产物（bin+xml 标准格式，可被 ov Core read_model / GenAI 加载），驱动层自写 pipeline（超越 llamacpp ov 后端的点：llamacpp ov 后端连加载 RWKV 都崩 CPY，我们至少 IR 全链路可用）。

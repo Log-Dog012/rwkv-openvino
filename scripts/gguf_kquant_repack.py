@@ -83,6 +83,10 @@ def repack_tensor(tensor) -> dict:
         r = repack_q8_0(raw, n, shape); r["gguf_type"] = "Q8_0"; return r
     if tt == "Q6_K":
         r = _repack_q6_k(raw, n, shape); r["gguf_type"] = "Q6_K"; return r
+    if tt == "Q5_K":
+        codes, scales, mins = repack_q5_k(raw, n)
+        return {"type": "i8", "gguf_type": "Q5_K", "codes": codes,
+                "scales": scales, "zp": mins, "group": 32, "shape": shape}
     if tt in ("F16",):
         return {"type": "f16", "gguf_type": "F16", "data": raw.view(np.float16),
                 "shape": shape}
@@ -92,9 +96,37 @@ def repack_tensor(tensor) -> dict:
     raise NotImplementedError(f"未实现的 GGUF 类型: {tt}")
 
 
+def repack_q5_k(raw: np.ndarray, n_elements: int):
+    """GGUF Q5_K 整张量 -> (codes[n], scales[n/32], zp[n/32]). 向量化版.
+    单 block 语义（对照 gguf Q5_K.dequantize_blocks）:
+      block 176B = d(2) + dmin(2) + scales(12) + qh(32) + qs(128)
+      d=f16, dmin=f16, scales 12B 同 Q4_K 编码 -> sc[8], m[8]
+      ql = qs.reshape(4,1,32) >> [0,4] & 0x0F -> (8,32)        # 低 4 位
+      qh2 = qh.reshape(1,32) >> [0..7] & 0x01 -> (8,32)         # 高 1 位（每字节 bit i -> 组 i）
+      q = ql | (qh2 << 4)                                      # 5-bit 值 0-31
+      scales_abs = d*sc, mins_abs = dmin*m                     # 各 [8]（非对称）
+    """
+    nblk = n_elements // QK_K
+    blocks = raw[: nblk * 176].reshape(nblk, 176).astype(np.uint8)
+    d = _read_f16_batch(blocks, 0, nblk)                        # [nblk]
+    dmin = _read_f16_batch(blocks, 2, nblk)                    # [nblk]
+    sc, m = get_scale_min_q4k(blocks[:, 4:16].reshape(nblk, 12))  # 各 [nblk,8]
+    scales = (d[:, None] * sc).astype(np.float32).reshape(-1)  # [nblk*8] 绝对 scale
+    mins = (dmin[:, None] * m).astype(np.float32).reshape(-1)  # [nblk*8] 绝对 min
+    # ql: qs 128B -> (4,1,32) >> [0,4] & 0x0F -> (4,2,32) -> (8,32)
+    qs = blocks[:, 48:176].reshape(nblk, 4, 1, 32)
+    ql = (qs >> np.array([0, 4], np.uint8).reshape(1, 1, 2, 1)) & 0x0F
+    ql = ql.reshape(nblk, 8, 32)
+    # qh: 32B -> (1,32) >> [0..7] & 0x01 -> (8,32)（每字节 bit i -> 组 i 的 32 元素）
+    qh = blocks[:, 16:48].reshape(nblk, 1, 32)
+    qh2 = (qh >> np.arange(8, dtype=np.uint8).reshape(1, 8, 1)) & 0x01
+    qh2 = qh2.reshape(nblk, 8, 32)
+    codes = (ql | (qh2 << np.uint8(4))).reshape(nblk, 256).astype(np.uint8)
+    return codes.reshape(-1), scales, mins
+
+
 def _decode_q6_k_block(blk):
     """单 block(210B)解码 -> (codes[256]int8, scales[16]f32). 严格对照 gguf Q6_K.dequantize_blocks."""
-    ql = blk[:128].reshape(2, 64)      # 128B -> (2,64), 与 gguf reshape(-1,1,64) 一致
     qh = blk[128:192].reshape(2, 32)    # 64B -> (2,32)
     sc8 = blk[192:208].astype(np.int8).astype(np.float32)   # int8, 无偏移
     d = _read_f16(blk, 208)
