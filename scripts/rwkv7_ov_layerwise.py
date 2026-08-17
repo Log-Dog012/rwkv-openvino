@@ -220,7 +220,7 @@ def main():
     core = ov.Core()
     try:
         core.set_property("CPU", {ov.properties.inference_num_threads: args.threads,
-                                  ov.properties.hint.performance_mode: ov.properties.hint.PerformanceMode.LATENCY})
+                                  ov.properties.cache_dir: "out/ov_cache"})
     except Exception:
         pass
 
@@ -300,7 +300,7 @@ def main():
         del req
         return x_out, vf_out, lg
 
-    tok = TRIE_TOKENIZER_safe("rwkv_vocab_v20230424.txt")
+    tok = TRIE_TOKENIZER_safe(os.path.join(os.path.dirname(os.path.abspath(__file__)), "rwkv_vocab_v20230424.txt"))
     ids = tok.encode(args.prompt)
     print(f"[cw] prompt({len(ids)} tok): {args.prompt!r}", flush=True)
 
@@ -319,8 +319,7 @@ def main():
             if lg is not None:
                 last_logits = lg
         del comp; gc.collect(); free_gguf_pages()
-        print(f"[cw] prompt sweep chunk {ci} ({chunks[ci][0]}-{chunks[ci][1]-1}) done, mem="
-              f"{open('/sys/fs/cgroup/memory.current').read().strip()[:6]}B", flush=True)
+        print(f"[cw] prompt sweep chunk {ci} ({chunks[ci][0]}-{chunks[ci][1]-1}) done", flush=True)
         stream, vf_stream = new_stream, new_vf
     print(f"[cw] prompt sweep done in {time.time()-t0:.1f}s", flush=True)
 

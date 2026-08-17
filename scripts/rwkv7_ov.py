@@ -243,7 +243,8 @@ def build_rwkv7_ov(gguf_path, max_layers=None):
 
 def main():
     A = argparse.ArgumentParser()
-    A.add_argument("gguf")
+    A.add_argument("gguf", nargs="?", default=None, help="GGUF 模型路径（构图路径需要；--load-ir 路径下仅用于读 V/C/L/H/N 元数据，可省）")
+    A.add_argument("--load-ir", default=None, help="跳过构图，直接加载此 IR xml 编译推理（配合 --gguf 元数据 或 --meta）")
     A.add_argument("--device", default="CPU")
     A.add_argument("--prompt", default="The Eiffel Tower is located in the city of")
     A.add_argument("--n", type=int, default=16)
@@ -253,27 +254,68 @@ def main():
     A.add_argument("--no-compile", action="store_true", help="只导出 IR，不编译不推理")
     args = A.parse_args()
 
-    t0 = time.time()
-    model, (V, C, L, H, N) = build_rwkv7_ov(args.gguf, max_layers=args.layers or None)
-    print(f"[ov] built graph in {time.time()-t0:.1f}s, devices={args.device} threads={args.threads}", flush=True)
+    def _flag(msg):
+        try: open("logs/build_progress.log","a").write(msg + "\n")
+        except Exception: pass
 
-    # 先落盘 IR（不依赖编译）：即便后续编译 OOM 也已保住产物，可换机/低内存方式编译
-    if args.out:
-        # 文件级 fadvise: 丢弃 cgroup 页缓存里 GGUF 的文件页(旧进程残留), 给 save_model 腾出内存, 无需 root
+    core = ov.Core()
+
+    # ---- 路径 B: 加载已落盘 IR 编译推理（不构全图，秒级加载）----
+    if args.load_ir:
+        if args.gguf is None:
+            print("[ov] --load-ir 需要同时给位置参 gguf 用于读 V/C/L/H/N 元数据", flush=True)
+            sys.exit(2)
+        # 从 GGUF 元数据读超参（不构全图，仅 dequant emb 取 shape）
+        import gguf as _gguf
+        r = _gguf.GGUFReader(args.gguf)
+        T = {t.name: t for t in r.tensors}
+        emb_raw = _dequant_np(T["token_embd.weight"])
+        V, C = emb_raw.shape
+        L_full = max(int(n.split(".")[1]) for n in T if n.startswith("blk.")) + 1
+        L = min(L_full, args.layers) if args.layers else L_full
+        H, N = C // 64, 64
+        del r, T, emb_raw
+        print(f"[ov] load-ir mode: V={V} C={C} L={L} H={H} N={N}, ir={args.load_ir}", flush=True)
+        model = core.read_model(args.load_ir)
+    else:
+        # ---- 路径 A: 构全图 ----
+        if args.gguf is None:
+            print("[ov] 需要 gguf 位置参（或用 --load-ir）", flush=True); sys.exit(2)
+        _flag(f"START {time.strftime('%H:%M:%S')} out={args.out}")
+        t0 = time.time()
         try:
-            fd = os.open(args.gguf, os.O_RDONLY)
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd)
+            model, (V, C, L, H, N) = build_rwkv7_ov(args.gguf, max_layers=args.layers or None)
+            _flag(f"BUILT graph in {time.time()-t0:.1f}s V={V} C={C} L={L}")
         except Exception:
-            pass
-        ov.save_model(model, args.out, compress_to_fp16=True)
-        print(f"[ov] saved IR -> {args.out}")
+            import traceback
+            open("logs/build_crash.log","w").write(traceback.format_exc())
+            _flag("CRASH during build")
+            raise
+        print(f"[ov] built graph in {time.time()-t0:.1f}s, devices={args.device} threads={args.threads}", flush=True)
+
+        # 先落盘 IR（不依赖编译）：即便后续编译 OOM 也已保住产物，可换机/低内存方式编译
+        if args.out:
+            # 文件级 fadvise: 丢弃 cgroup 页缓存里 GGUF 的文件页(旧进程残留), 给 save_model 腾出内存, 无需 root
+            try:
+                fd = os.open(args.gguf, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                ov.save_model(model, args.out, compress_to_fp16=True)
+                _flag(f"SAVED IR -> {args.out}")
+            except Exception:
+                import traceback
+                open("logs/build_crash.log","w").write(traceback.format_exc())
+                _flag("CRASH during save_model")
+                raise
+            print(f"[ov] saved IR -> {args.out}")
 
     if args.no_compile:
         print("[ov] --no-compile: 仅导出 IR，跳过编译与推理。")
         return
 
-    core = ov.Core()
     import gc, subprocess
     gc.collect()
     # 回收 build 阶段读 GGUF 留下的 page cache（计入 cgroup memory.current），压低编译峰值
@@ -289,7 +331,7 @@ def main():
         print(f"[ov] warn: set_property failed ({e}); fallback default threads")
     tc = time.time()
     comp = core.compile_model(model, args.device)
-    print(f"[ov] compiled in {time.time()-tc:.1f}s, running ...", flush=True)
+    print(f"[ov] compiled ({args.device}) in {time.time()-tc:.1f}s, running ...", flush=True)
     ins = {i.any_name: i for i in comp.inputs}
     req = comp.create_infer_request()
 

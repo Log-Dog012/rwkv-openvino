@@ -26,42 +26,47 @@ def _read_f16(arr, off):
 
 
 def get_scale_min_q4k(scales: np.ndarray):
-    """与 gguf.quants.Q4_K.get_scale_min 完全一致. 输入 [nblk,12] uint8 -> (sc[8], mn[8])."""
+    """与 gguf.quants.Q4_K.get_scale_min 完全一致. 输入 [nblk,12] uint8 -> (sc[8], mn[8]).
+    向量化版：支持任意 nblk 批量，输出 [nblk,8]."""
     s = scales.reshape(-1, 3, 4).astype(np.uint8)
     d, m, m_d = np.split(s, 3, axis=-2)
     sc = np.concatenate([d & 0x3F, (m_d & 0x0F) | ((d >> 2) & 0x30)], axis=-1)
     mn = np.concatenate([m & 0x3F, (m_d >> 4) | ((m >> 2) & 0x30)], axis=-1)
+    # 保留对单 block [1,12] 输入的回退：reshape(-1,8) 已自然兼容
     return sc.reshape(-1, 8).astype(np.float32), mn.reshape(-1, 8).astype(np.float32)
 
 
-def unpack_q4_k_block(block: np.ndarray):
-    """输入 144 字节 Q4_K block, 返回 (codes[256]uint8 0-15, scales[8]abs, mins[8]abs)."""
-    d = _read_f16(block, 0)
-    dmin = _read_f16(block, 2)
-    sc, mn = get_scale_min_q4k(block[4:16].reshape(1, 12))
-    sc, mn = sc[0], mn[0]
-    scales = (d * sc).astype(np.float32)   # 绝对 scale [8]
-    mins = (dmin * mn).astype(np.float32)  # 绝对 zp [8]
-    qs = block[16:144]
-    # 与 gguf 完全一致: reshape(-1,1,32) >> [0,4] & 0x0F -> (8,32) 逐行铺开
-    qs_nib = (qs.reshape(4, 1, 32) >> np.array([0, 4], np.uint8).reshape(1, 2, 1)) & 0x0F
-    codes = qs_nib.reshape(-1).astype(np.uint8)  # 256 值, 顺序与 gguf 同
-    return codes, scales, mins
+def _read_f16_batch(arr, off, nblk):
+    """批量读 [nblk] 个 f16 at offset off (每 block 内). 返回 [nblk] float32."""
+    seg = arr[:, off:off + 2].reshape(-1)  # [nblk*2] bytes
+    f16 = np.frombuffer(seg.tobytes(), dtype=np.float16).astype(np.float32)
+    return f16  # [nblk]
 
 
 def repack_q4_k(raw: np.ndarray, n_elements: int):
-    """GGUF Q4_K 整张量 raw -> (u4codes[n], scales[n/32], zp[n/32]). 已展开为绝对 scale/min."""
+    """GGUF Q4_K 整张量 raw -> (codes[n], scales_abs[n/32], zp_abs[n/32]).
+    向量化版：一次处理全部 nblk 个 block，输出顺序与逐块版完全一致。
+    单 block 语义（unpack_q4_k_block）的批等价：
+      d = f16(block,0), dmin = f16(block,2)
+      sc, mn = get_scale_min(block[4:16])            # 各 [8]
+      scales_abs = d * sc, mins_abs = dmin * mn      # [8]
+      codes = (block[16:144].reshape(4,1,32) >> [0,4]) & 0x0F  -> reshape(256)"""
     nblk = n_elements // QK_K
-    raw = raw[: nblk * 144].reshape(nblk, 144)
-    codes = np.empty(nblk * QK_K, dtype=np.uint8)
-    scales = np.empty(nblk * 8, dtype=np.float32)
-    mins = np.empty(nblk * 8, dtype=np.float32)
-    for b in range(nblk):
-        c, s, m = unpack_q4_k_block(raw[b])
-        codes[b * QK_K:(b + 1) * QK_K] = c
-        scales[b * 8:(b + 1) * 8] = s
-        mins[b * 8:(b + 1) * 8] = m
-    return codes, scales, mins
+    blocks = raw[: nblk * 144].reshape(nblk, 144).astype(np.uint8)
+
+    # scales / zp（每 block 8 组）
+    d = _read_f16_batch(blocks, 0, nblk)                       # [nblk] f16->f32
+    dmin = _read_f16_batch(blocks, 2, nblk)                   # [nblk]
+    sc, mn = get_scale_min_q4k(blocks[:, 4:16].reshape(nblk, 12))  # 各 [nblk,8]
+    scales = (d[:, None] * sc).astype(np.float32).reshape(-1)  # [nblk*8] 绝对 scale
+    mins = (dmin[:, None] * mn).astype(np.float32).reshape(-1) # [nblk*8] 绝对 zp
+
+    # codes：每 block 128B -> 256 nibbles
+    qs = blocks[:, 16:144].reshape(nblk, 4, 1, 32)             # [nblk,4,1,32]
+    sh = np.array([0, 4], np.uint8).reshape(1, 1, 2, 1)        # 广播 [1,1,2,1]
+    nib = (qs >> np.array([0, 4], np.uint8).reshape(1, 1, 2, 1)) & 0x0F  # [nblk,4,2,32]
+    codes = nib.reshape(nblk, -1).astype(np.uint8)            # [nblk,256]
+    return codes.reshape(-1), scales, mins
 
 
 def repack_tensor(tensor) -> dict:
@@ -105,17 +110,31 @@ def _decode_q6_k_block(blk):
 
 
 def _repack_q6_k(raw, n, shape):
-    """GGUF Q6_K (210B/block, 256 元素) -> OV i8 codes + per16 scale (对称)."""
+    """GGUF Q6_K (210B/block, 256 元素) -> OV i8 codes + per16 scale (对称).
+    向量化版：一次处理全部 nblk 个 block，输出顺序与逐块版完全一致。
+    单 block 语义（_decode_q6_k_block）的批等价见行内注释。"""
     nblk = n // QK_K
-    raw = raw[: nblk * 210].reshape(nblk, 210)
-    codes = np.empty(nblk * QK_K, dtype=np.int8)
-    scales = np.empty(nblk * 16, dtype=np.float32)
-    for b in range(nblk):
-        c, s = _decode_q6_k_block(raw[b])
-        codes[b * QK_K:(b + 1) * QK_K] = c
-        scales[b * 16:(b + 1) * 16] = s
-    return {"type": "i8", "codes": codes, "scales": scales, "zp": None,
-            "group": 16, "shape": shape}
+    blocks = raw[: nblk * 210].reshape(nblk, 210).astype(np.uint8)
+
+    # 低 4 位: 128B -> (2,64) per block -> (nblk,2,1,64) >> [0,4] & 0x0F -> (nblk,2,2,64) -> (nblk,8,32)
+    ql = blocks[:, :128].reshape(nblk, 2, 64)
+    ql4 = (ql.reshape(nblk, 2, 1, 64) >> np.array([0, 4], np.uint8).reshape(1, 1, 2, 1)) & 0x0F
+    ql4 = ql4.reshape(nblk, 8, 32)
+    # 高 2 位: 64B -> (2,32) per block -> (nblk,2,1,32) >> [0,2,4,6] & 0x03 -> (nblk,2,4,32) -> (nblk,8,32)
+    qh = blocks[:, 128:192].reshape(nblk, 2, 32)
+    qh2 = (qh.reshape(nblk, 2, 1, 32) >> np.array([0, 2, 4, 6], np.uint8).reshape(1, 1, 4, 1)) & 0x03
+    qh2 = qh2.reshape(nblk, 8, 32)
+    # q = (ql4 | (qh2<<4)) - 32 -> (nblk,8,32) -> reshape(nblk,16,16) -> (nblk,256)
+    q = ((ql4 | (qh2 << 4)).astype(np.int8) - np.int8(32)).reshape(nblk, 16, 16).reshape(nblk, -1)
+
+    # scales: 每 block 16 组, sc8 int8 [nblk,16], d f16 [nblk] -> abs [nblk,16]
+    sc8 = blocks[:, 192:208].astype(np.int8).astype(np.float32)   # [nblk,16]
+    d = _read_f16_batch(blocks, 208, nblk)                       # [nblk]
+    scales = (d[:, None] * sc8).astype(np.float32)              # [nblk,16]
+
+    codes = q.reshape(-1).astype(np.int8)                        # [nblk*256]
+    return {"type": "i8", "codes": codes, "scales": scales.reshape(-1),
+            "zp": None, "group": 16, "shape": shape}
 
 
 def repack_q8_0(raw, n, shape):
