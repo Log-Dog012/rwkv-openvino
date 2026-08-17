@@ -117,5 +117,33 @@ llamacpp openvino 后端对 RWKV 报 CPY 错（cache_r_l0 跨 buffer），无法
 
 **结果：未跑通——产物残缺**。ovms.exe / openvino.dll / openvino_c.dll / openvino_genai.dll / openvino_intel_{cpu,gpu,npu}_plugin.dll / opencv_world4130.dll / git2.dll 全是 **0 字节空文件**（`file` 报 `empty`），只有 tbb12.dll（225KB）和 python/python.exe（104KB）是实的。PowerShell 调 ovms.exe 报「不是此操作系统平台的有效应用程序」——根因不是架构兼容，是产物本身空。
 
-**未补成「OV 单图常驻 vs llamacpp」同口径对比**——OV 链路在本机的可行路径只有分块执行器（含重编译代价），llamacpp 是单图全程。本报告 §一 的口径差异说明继续适用：OV 纯推理 0.68/1.63/1.31 t/s（CPU/GPU/NPU，分块架构）vs llamacpp 7.14/5.93/5.87 t/s（vulkan/sycl/CPU，单图全程），量级可比但非严格同口径。真要严格同口径需 ovms 跑通（待完整产物）或 OV 单图编译预热跑通（本机 CPU 61 层 JIT >10 分钟崩/超时）。
+**OV 单图常驻路径探底：物理内存不够，跑不通**。用 `scripts/ov_single_graph_bench.ps1` 在沙箱外 pwsh 跑（绕开 bash 工具 300s 上限的真因，非 OV 本身崩），CPU 单图编译实测 **1991.3s ≈ 33min** 跑通（OV CPU 插件 JIT 融合 61 层全 K-quant 子图，编译产物物化到 `out/ov_cache` 一个 **53GB blob**），编译完进 prompt sweep 跑通出 `first gen token id=37138`（与官方基线一致）。但稳态生成段崩在物理内存上限：
+
+- 编译期：blob 53GB（盘上）+ python 进程物化缓冲 ~21GB → 推理期常驻 ~20GB
+- 本机 32GB LPDDR5 物理内存（31.2/31.5GB 99% 占满），OV 单图常驻推理 13.3b 全 61 层 K-quant 融合 kernel 常驻需求 > 32GB → 系统分页/压缩顶不住，推理段 OOM
+- **根因**：OV CPU 插件单图常驻路径在本机 32GB 物理内存上不可行，不是沧海本 bug 也不是 bash 工具限制。沙箱的 8GB 限制换成本机的 32GB 限制，本质一样：单图常驻 OV 跑不通，**分块执行器是唯一可行路径**
+
+### OV 分块执行器 vs llamacpp 最终对比（同 prompt 同 n，本机可行口径）
+
+| 链路 / 设备 | 稳态 tg t/s | 相对最快 | 口径 |
+|---|---|---|---|
+| **llamacpp vulkan** | **7.14** | 1.00×（基准） | 单图全程常驻 |
+| llamacpp sycl | 5.93 | 0.83× | 单图全程常驻 |
+| llamacpp CPU | 5.87 | 0.82× | 单图全程常驻 |
+| **OV GPU**（核显） | **1.63** | 0.23× | 分块 8 chunk 推理 sum（纯推理，含重编译代价） |
+| OV NPU | 1.31 | 0.18× | 分块 8 chunk 推理 sum |
+| OV CPU | 0.68 | 0.10× | 分块 8 chunk 推理 sum |
+
+**口径差异说明**（不可直接数字比，量级参考）：
+- llamacpp：单图全程、ggml 原生调度、权重常驻核显显存（uma 架构无拷贝），tg 反映稳态生成速度
+- OV 链路：分块执行器每 token 重载全 8 chunk 编译（为沙箱 8GB 写的架构，本机 32GB 也得用这路径因单图常驻物理内存不够），纯推理口径含重编译开销
+- 真要严格同口径需 OV 单图常驻跑通——本机物理内存不够（编译产物 53GB + 推理常驻 20GB > 32GB），需 64GB+ 内存机器或 OV 插件 JIT 产物瘦身
+
+**同设备对比**：核显 OV GPU 1.63 vs llamacpp vulkan 7.14（llamacpp **4.4×** 快）；CPU OV 0.68 vs llamacpp 5.87（llamacpp **8.6×** 快）。OV 链路慢的根因是分块架构代价 + OV 插件 JIT 开销，不是推理 kernel 本身——分块执行器的价值在「绕开单图常驻内存上限」+「三设备统一 IR」，不在速度。
+
+### 历史路径记录
+
+- **ovms 常驻服务**：`C:\Users\Mcsof\Application\ovms` 产物残缺（ovms.exe + 全 OV 插件 dll 都是 0 字节空文件），未跑通
+- **OV 单图常驻**：CPU 编译跑通（1991.3s）但推理段 OOM（物理内存 32GB 不够），GPU/NPU 同路径预计同样物理内存不够，未单测
+- **可行路径**：分块执行器（本报告 §二数字）是本机唯一能跑通 13.3b 的 OV 链路
 

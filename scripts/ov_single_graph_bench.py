@@ -67,37 +67,45 @@ def main():
 
     # ---- prompt 扫描（吃 prompt，建状态）----
     last = None
-    for t in ids:
+    t_sweep = time.time()
+    for ti, t in enumerate(ids):
+        t0 = time.time()
         req.infer({ins["idx"]: np.array([t], np.int64),
                    ins["s_att_x"]: sa, ins["s_kv"]: sk, ins["s_ffn"]: sf})
         last = np.array(req.get_output_tensor(0).data)
         sa = np.asarray(req.get_output_tensor(1).data).reshape(L, C)
         sk = np.asarray(req.get_output_tensor(2).data).reshape(L, H, N, N)
         sf = np.asarray(req.get_output_tensor(3).data).reshape(L, C)
-    print(f"[bench] prompt sweep done, first gen token id={int(np.argmax(last[0]))}", flush=True)
+        print(f"[bench] sweep tok {ti}/{len(ids)} in {time.time()-t0:.2f}s (infer+copy)", flush=True)
+    print(f"[bench] prompt sweep done in {time.time()-t_sweep:.1f}s, first gen token id={int(np.argmax(last[0]))}", flush=True)
 
     # ---- 预热（不计稳态）----
     for _ in range(args.warmup):
         t = int(np.argmax(last))
+        t0 = time.time()
         req.infer({ins["idx"]: np.array([t], np.int64),
                    ins["s_att_x"]: sa, ins["s_kv"]: sk, ins["s_ffn"]: sf})
         last = np.array(req.get_output_tensor(0).data)
         sa = np.asarray(req.get_output_tensor(1).data).reshape(L, C)
         sk = np.asarray(req.get_output_tensor(2).data).reshape(L, H, N, N)
         sf = np.asarray(req.get_output_tensor(3).data).reshape(L, C)
+        print(f"[bench] warmup tok in {time.time()-t0:.2f}s", flush=True)
 
-    # ---- 稳态生成测速 ----
+    # ---- 稳态生成测速（每 token 打耗时，终止也出部分数字）----
     gen = []
     tb = time.time()
     for g in range(args.n):
         t = int(np.argmax(last))
         gen.append(t)
+        t0 = time.time()
         req.infer({ins["idx"]: np.array([t], np.int64),
                    ins["s_att_x"]: sa, ins["s_kv"]: sk, ins["s_ffn"]: sf})
         last = np.array(req.get_output_tensor(0).data)
         sa = np.asarray(req.get_output_tensor(1).data).reshape(L, C)
         sk = np.asarray(req.get_output_tensor(2).data).reshape(L, H, N, N)
         sf = np.asarray(req.get_output_tensor(3).data).reshape(L, C)
+        dt = time.time() - t0
+        print(f"[bench] gen {g+1}/{args.n} tok in {dt:.2f}s ({1/dt:.2f} t/s) ids={gen} text={tok.decode(gen)!r}", flush=True)
     elapsed = time.time() - tb
     tps = args.n / elapsed
     print(f"[bench] === {args.device} tg: {tps:.2f} t/s ({args.n} tokens in {elapsed:.2f}s) ===", flush=True)
