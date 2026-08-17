@@ -67,3 +67,47 @@ L=16 的 perf counter：**耗时大头是 FFN matmul（ffk/ffv，16384×4096）�
 | L=8 整图推理 | 0.41s | 分块 chunk 量级 |
 | L=16 整图推理（二次） | 2.2s | 已含 FFN 退化（~5.4× 超线性） |
 | 61 层单图推理 | ~200s/token | FFN 退化 ×61 层 + 内存 31GB 换页 |
+
+---
+
+## 七、后续调查补充（task 5 轮）
+
+### 7.1 FFN 退化序列（L=2/4/8/16 整图内 FFN 单 op 耗时）
+
+| 层数 | 整图推理(二次) | FFN avg | FFN max | 结论 |
+|---|---|---|---|---|
+| L=2 | 46ms | 4.9ms | 5.7ms | 正常（单 matmul 量级） |
+| L=4 | 81ms | 4.8ms | 5.2ms | 正常 |
+| L=8 | 217ms | 20.0ms | 37.1ms | **开始退化（4×）** |
+| L=16 | 480ms | 34.0ms | 204.3ms | 退化加重（7× avg / 37× max） |
+
+**退化是渐进超线性，非单点跳变**——起点在 L=8 附近，随层数加剧。根因推测为整图 kernel 变体数/内存布局/cache 压力（非 matmul 本身）。
+
+### 7.2 OV 新属性测试（L=8 图，测能否改 FFN kernel 选择）
+
+| 属性 | infer | FFN avg | 结论 |
+|---|---|---|---|
+| baseline | 207ms | 10.7ms | 参照 |
+| ENABLE_WEIGHTLESS | 265ms | 20.9ms | ❌ 更差 |
+| DYNAMIC_QUANTIZATION_GROUP_SIZE=32 | 145ms | 18.9ms | ❌ FFN 更差 |
+| INFERENCE_PRECISION_HINT=f16 | 229ms | 49.8ms | ❌ 更差 |
+
+**OV 属性全部无法改善 FFN 退化**——CPU 插件 kernel 变体选择是内部行为，无可调开关。
+
+### 7.3 openvino-genai 2026.3 加载我们的 IR（易用性验证）
+
+- `openvino_genai` import 成功（需 `os.add_dll_directory` 加 openvino + genai 两个 runtime bin）
+- **LLMPipeline 加载我们的 chunk IR 成功**（标准命名 `openvino_model.xml/bin` 放进目录，PIPE OK）——**bin+xml 通用性 ✅**
+- generate 报 `stop_token_ids` 含 -1：GenAI 期望 IR 带 eos token 元数据（generation_config），RWKV IR 没有——**属「pipeline 要写好」范畴，非 IR 结构问题**
+
+### 7.4 项目路线图（面向目标：速度/精度/内存/易用性对标 llamacpp ov 后端）
+
+| 目标 | 现状 | 差距 | 路线 |
+|---|---|---|---|
+| **精度**（与 gguf 同等 K-quant） | ✅ 已达成（repack bit-exact，L=1 验证 err 2.4e-7） | — | 保持 |
+| **内存**（对标 gguf ~8GB） | 分块 ~6.5GB / 单图 31GB（退化） | 单图需 int4 8.4GB | 单图退化不可解（7.1/7.2），分块已接近 |
+| **速度**（追 llamacpp 7.14 t/s） | 分块 0.68/1.63/1.31 t/s | 4-9× | 单图退化是瓶颈，当前 OV 版本不可解 |
+| **易用性**（bin+xml 通用） | GenAI 加载 ✅，generate 需补 eos 元数据 | tokenizer IR 未转 | 补 generation_config 元数据 + 转 RWKV tokenizer IR（openvino_tokenizers 有 RWKV 例子） |
+| **可部署**（HF 发布 IR） | 1.5b/7.2b/13.3b 已上传 ModelScope | — | 保持 |
+
+**关键结论**：当前 OV 2026.3 的 CPU 插件对「61 层整图 FFN matmul」有不可调的退化（渐进超线性 + 无可调属性），单图常驻不可行。**分块执行器是唯一可行路径**（绕开退化 + 内存墙）。速度上追平 llamacpp 的路线：等 OV 上游修整图退化，或自定义 op 强制 int4 处理 FFN 大 matmul（预期收益有限，单 matmul 融合已快）。易用性路线：补 eos 元数据 + tokenizer IR 让 GenAI 直接驱动我们的 IR。
