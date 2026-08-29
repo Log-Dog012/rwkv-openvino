@@ -93,6 +93,11 @@ def repack_tensor(tensor) -> dict:
     if tt in ("F32",):
         return {"type": "f32", "gguf_type": "F32", "data": raw.view(np.float32),
                 "shape": shape}
+    if tt == "BF16":
+        # BF16 -> F32 bit-exact（低位补 0），上游 f16 路径再统一定点
+        f32 = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+        return {"type": "f32", "gguf_type": "BF16", "data": f32,
+                "shape": shape}
     raise NotImplementedError(f"未实现的 GGUF 类型: {tt}")
 
 

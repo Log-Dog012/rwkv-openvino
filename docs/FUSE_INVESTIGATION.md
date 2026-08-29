@@ -152,3 +152,55 @@ L=16 的 perf counter：**耗时大头是 FFN matmul（ffk/ffv，16384×4096）�
 - **踩坑**：①参数名 `gguf` 遮蔽 `import gguf` 模块（改名 `gguf_path`）②`_ir_dir` 未存实例 ③`_full_pass` 需链式 x_in/vf_in 传递（非 stream 数组）④tokenizer IR compile 需 `import openvino_tokenizers` 注册 TrieTokenizer 扩展
 
 **易用性闭环达成**：我们的 IR（bin+xml）+ 官方 tokenizer IR + 自写 pipeline = 完整可用的「GGUF→OVIR→生成」链路，对标 llamacpp ov 后端（其连 RWKV 加载都崩 CPY）。
+
+---
+
+## 九、7.2B 单图（不分块）验证：退化复现 + GPU f16 数值问题首次暴露（task 7 轮，2026-08-29）
+
+> 背景：在本机 32GB（Core Ultra 7 155H）把 7.2B（`rwkv7-g1i-7.2b-20260805-ctx16384.i1-Q4_K_M.gguf`，4.9GB，
+> L=32 / C=4096 / FFN 16384，与 13.3B 同宽）做单图 K-quant IR，验证整图 FFN 退化是否复现，
+> 并尝试单图常驻绕开分块架构。环境 conda AI + OV 2026.3.0。
+
+### 9.1 分层退化曲线（perf counter，CPU 8 线程，`scripts/ffn_degradation_probe.py`）
+
+| 层数 | 整图 infer 稳态 | ffk avg | ffv avg | 对照 13.3B（§7.1） |
+|---|---|---|---|---|
+| L=2 | 60.8ms | 6.5ms | 6.3ms | 46ms / 4.9ms（正常） |
+| L=4 | 124.6ms | 7.1ms | 7.6ms | 81ms / 4.8ms（正常） |
+| L=8 | 210.6ms | **7.6ms（未退化！）** | 7.8ms | 217ms / 20ms（已退化 4×） |
+| L=16 | 552.9ms | **61.8ms（退化 8×）** | 60.2ms | 480ms / 34ms |
+
+- 7.2B 退化起点比 13.3B **晚**（L=8 仍单 matmul 量级），但 L=16 退化更猛（61.8 vs 34ms）；
+- L=8→16 整图推理 2.6× 超线性，与 13.3B 的「渐进超线性」模式一致；
+- **结论：整图 FFN 退化与模型规模无关（同 C/FFN 宽度下按层数复现），起点具体位置有波动（8~16 之间），不可靠层间外推。**
+
+### 9.2 全图（L=32）单图常驻 bench（`ov_single_graph_bench.py`）
+
+| 设备 | 编译 | 稳态 tg | 数值 | 备注 |
+|---|---|---|---|---|
+| CPU（8 线程） | 738.5s | **0.04 t/s（~25s/token）** | ✅ 首 token 37138 与基线一致，生成 ", France. It" | 退化复现，与 13.3B 单图 200s/token 同级问题 |
+| GPU（核显，f16 默认） | 185.3s | **3.23 t/s** | ❌ 生成 " inconvencombeally webs" 乱码 | 无性能退化！但数值错（见 9.3） |
+| GPU（INFERENCE_PRECISION_HINT=f32） | 843.4s | 0.004 t/s（~250s/token） | ✅ 与 CPU 完全一致 | 全图抬 f32 修复数值但完全不可用 |
+
+- IR：`out/rwkv7-7.2b-q4k_ov.xml`（bin 6.0GB，GGUF 4.9GB）。CPU 编译缓存 `out/ov_cache` 已达 **76GB**，注意磁盘。
+- GPU 单图 3.23 t/s vs 13.3B **分块** GPU 1.63 t/s——若无数值问题，单图在 GPU 上反而比分块快一倍（分块的每 token 重载 chunk 代价在 GPU 上同样存在）。
+
+### 9.3 GPU f16 数值问题定位（重要新发现）
+
+| 图 | CPU vs GPU-f16 | CPU vs GPU-f32（HINT） |
+|---|---|---|
+| L=1 | maxabs **3.58**，top1 不一致 | maxabs 0.0078，top1 ✅ |
+| L=2 | maxabs 11.07 | maxabs 0.0078 |
+| L=8 | maxabs 14.54 | — |
+| L=32 | maxabs 27.70，生成乱码 | 与 CPU 完全一致 |
+
+- **GPU f16 从第 1 层就错**（不是跨层累积才出错），GPU f32 完全正确 → 根因是 **GPU 插件对 compressed-weights（int4/u8）FullyConnected 用 f16 累加**（CPU 插件 FC 累加 f32 所以 bit-exact），RWKV 乘性状态递归把 f16 累加误差放大成 logits 灾难。
+- **历史验证盲区**：此前「L=1 验证 err 2.4e-7 PASS」只在 CPU 上做过，GPU 数值从未被单独验证过——GPU 上的分块推理速度（13.3B GPU 1.63 t/s 等）很可能同样产出乱码，**速度数字有效、文本不可信**。
+- 修复尝试：`ALLOW_PRECISION_REDUCTION`（低版本 OV 的「仅 FC 保持 f32 累加」属性）在 2026.3 **已不存在**；`INFERENCE_PRECISION_HINT=f32` 是全图抬精度，代价不可接受。**待试出路**：① 报 OV 上游（GPU int4 FC 累加精度无开关）；② 图级 workaround——把解量化子图输出/FC 输出显式 f32 化（只抬 matmul 相关精度，激活大头保持 f16，代价待测）；③ GPU 只用于对精度不敏感的场合或配合输出校验。
+
+### 9.4 最终结论（task 7）
+
+1. **7.2B 单图 CPU 复现整图 FFN 退化**（0.04 t/s），退化与模型规模无关、按层数渐进超线性——分块执行器仍是 CPU 唯一可行路径（结论与 §7.4 一致）。
+2. **GPU 单图无退化且最快（3.23 t/s，编译仅 185s）**，但 f16 累加数值错误使其不可用于生成；这是 OV 2026.3 GPU 插件对 int4 FC 的行为，属性层面无解。
+3. 附带修复：`gguf_kquant_repack.py` 新增 **BF16** 分支（7.2B GGUF 的小 matmul a1/a2/g1/g2/v1/v2 是 BF16，bit-exact 转 f32）；`ov_single_graph_bench.py` 支持 GPU（不再传 INFERENCE_NUM_THREADS）+ `--fp32-hint` 开关。
+4. 新工具：`scripts/ffn_degradation_probe.py`（任意 GGUF 任意层数的 FFN 退化探针，替代散失的 task 5 脚本）。

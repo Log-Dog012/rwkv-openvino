@@ -22,6 +22,8 @@ def main():
     A.add_argument("--prompt", default="The Eiffel Tower is located in the city of")
     A.add_argument("--n", type=int, default=16, help="生成 token 数")
     A.add_argument("--warmup", type=int, default=2, help="预热推理次数（不计稳态）")
+    A.add_argument("--fp32-hint", action="store_true", help="INFERENCE_PRECISION_HINT=f32（GPU 数值修复试验，全图 f32，内存/速度代价大）")
+    A.add_argument("--no-prec-reduction", action="store_true", help="ALLOW_PRECISION_REDUCTION=false：仅强制 matmul f32 累加，激活/权重保持低精度")
     args = A.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,9 +43,14 @@ def main():
     # ---- load IR + 编译一次 ----
     core = ov.Core()
     try:
-        props = {ov.properties.inference_num_threads: args.threads}
+        props = {}
         if args.device == "CPU":
+            props[ov.properties.inference_num_threads] = args.threads
             props[ov.properties.cache_dir] = "out/ov_cache"
+        if args.fp32_hint:
+            props[ov.properties.hint.inference_precision] = ov.Type.f32
+        if args.no_prec_reduction:
+            props["ALLOW_PRECISION_REDUCTION"] = "NO"
         core.set_property(args.device, props)
     except Exception as e:
         print(f"[bench] warn: set_property failed ({e})", flush=True)
