@@ -204,3 +204,5 @@ L=16 的 perf counter：**耗时大头是 FFN matmul（ffk/ffv，16384×4096）�
 2. **GPU 单图无退化且最快（3.23 t/s，编译仅 185s）**，但 f16 累加数值错误使其不可用于生成；这是 OV 2026.3 GPU 插件对 int4 FC 的行为，属性层面无解。
 3. 附带修复：`gguf_kquant_repack.py` 新增 **BF16** 分支（7.2B GGUF 的小 matmul a1/a2/g1/g2/v1/v2 是 BF16，bit-exact 转 f32）；`ov_single_graph_bench.py` 支持 GPU（不再传 INFERENCE_NUM_THREADS）+ `--fp32-hint` 开关。
 4. 新工具：`scripts/ffn_degradation_probe.py`（任意 GGUF 任意层数的 FFN 退化探针，替代散失的 task 5 脚本）。
+
+**定论（2026-08-30）**：CPU 侧单图常驻（7.2B/13.3B）因整图 FFN 退化正式判死，不再投入；唯一悬念是 GPU 单图（3.23 t/s 无退化）能否绕过 f16 累加数值错误（§9.3 出路 ②）。编译缓存 `out/ov_cache`（76GB，含 13.3B 单图 JIT blob）已随之清理。
