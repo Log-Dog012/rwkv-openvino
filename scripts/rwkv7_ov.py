@@ -241,6 +241,43 @@ def build_rwkv7_ov(gguf_path, max_layers=None):
     return model, (V, C, L, H, N)
 
 
+def apply_fc_f32(model):
+    """把 K-quant 压缩权重 MatMul 的计算抬到 f32（权重码本保持 u4/i8，IR 体积不变）。
+
+    背景: GPU 插件 compressed-weights 融合 FC 用低精度累加（实测单层 logits 即偏差 3.6,
+    RWKV 乘性状态递归放大成乱码; CPU 融合 FC 累加 f32 无此问题）。本改写把匹配到的
+    MatMul 改为 f32 输入/累加/输出（随后转回原精度），绕开坏融合 kernel。
+    匹配条件: MatMul 的权重输入沿 Convert/Reshape/Multiply/Subtract/Add 链可追溯到
+    u4/i8/u8 Constant（即 build_compressed_weight 的解量化子图）。"""
+    from openvino import opset13 as _ops
+    LOW = {ov.Type.u4, ov.Type.i8, ov.Type.u8}
+
+    def root_low(out, depth=0):
+        n = out.get_node()
+        tn = n.get_type_name()
+        if tn == "Constant":
+            return out.get_element_type() in LOW
+        if depth > 10 or tn not in ("Convert", "Reshape", "Multiply", "Subtract", "Add"):
+            return False
+        return any(root_low(n.input_value(i), depth + 1) for i in range(len(n.inputs())))
+
+    changed = 0
+    for op in list(model.get_ordered_ops()):
+        if op.get_type_name() != "MatMul":
+            continue
+        if not root_low(op.input_value(1)):
+            continue
+        a, b = op.input_value(0), op.input_value(1)
+        a32 = _ops.convert(a, ov.Type.f32) if a.get_element_type() != ov.Type.f32 else a
+        b32 = _ops.convert(b, ov.Type.f32) if b.get_element_type() != ov.Type.f32 else b
+        mm = _ops.matmul(a32, b32, False, True, op.friendly_name + "_f32")
+        o16 = _ops.convert(mm, a.get_element_type()) if a.get_element_type() != ov.Type.f32 else mm
+        op.output(0).replace(o16.output(0))
+        changed += 1
+    print(f"[fc-f32] rewrote {changed} weight MatMul(s) to f32 compute", flush=True)
+    return model
+
+
 def main():
     A = argparse.ArgumentParser()
     A.add_argument("gguf", nargs="?", default=None, help="GGUF 模型路径（构图路径需要；--load-ir 路径下仅用于读 V/C/L/H/N 元数据，可省）")
@@ -252,6 +289,7 @@ def main():
     A.add_argument("--threads", type=int, default=4, help="CPU 线程数（降低以压低编译/推理峰值内存，cgroup 8GB 受限时设小）")
     A.add_argument("--layers", type=int, default=0, help="仅构建前 N 层（0=全部）。用于单层/少层验证，编译量远小于 8GB")
     A.add_argument("--no-compile", action="store_true", help="只导出 IR，不编译不推理")
+    A.add_argument("--fc-f32", action="store_true", help="K-quant 权重 MatMul 计算/累加抬 f32（GPU 数值修复，权重码本不变）")
     args = A.parse_args()
 
     def _flag(msg):
@@ -292,6 +330,9 @@ def main():
             _flag("CRASH during build")
             raise
         print(f"[ov] built graph in {time.time()-t0:.1f}s, devices={args.device} threads={args.threads}", flush=True)
+
+        if args.fc_f32:
+            model = apply_fc_f32(model)
 
         # 先落盘 IR（不依赖编译）：即便后续编译 OOM 也已保住产物，可换机/低内存方式编译
         if args.out:

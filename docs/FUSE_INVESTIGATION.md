@@ -206,3 +206,31 @@ L=16 的 perf counter：**耗时大头是 FFN matmul（ffk/ffv，16384×4096）�
 4. 新工具：`scripts/ffn_degradation_probe.py`（任意 GGUF 任意层数的 FFN 退化探针，替代散失的 task 5 脚本）。
 
 **定论（2026-08-30）**：CPU 侧单图常驻（7.2B/13.3B）因整图 FFN 退化正式判死，不再投入；唯一悬念是 GPU 单图（3.23 t/s 无退化）能否绕过 f16 累加数值错误（§9.3 出路 ②）。编译缓存 `out/ov_cache`（76GB，含 13.3B 单图 JIT blob）已随之清理。
+
+---
+
+## 十、GPU 数值问题深挖（task 8 轮，2026-08-30/31）与路线暂停
+
+### 10.1 根因定位（`scripts/fc_precision_probe.py` / `dequant_fidelity_probe.py` / `opwise_diff.py`）
+
+1. **逐 op 二分**（L=1 全中间节点 CPU vs GPU 对比，`scripts/opwise_diff.py`）：跑偏最早、最狠的节点是 **Q6_K（i8 码本）权重的 dequant 链**（`output.weight/deq_conv`、`channel_mix_value`，偏差 3.58）——不是 logits 后处理，是权重解量化+FC 融合本身。
+2. **解量化子图单测**（不接 MatMul）：GPU 与 CPU **逐元素一致** → 坏的不是 dequant 算子，是 **GPU 插件把「dequant 链 + MatMul」匹配成 compressed-weights 融合 FC 后的算错**。
+3. **触发条件**：u4/i8/u8、per16/per32、3D/4D reshape 全部复现（GPU 误差 0.03~0.21，CPU 同结构 0.002~0.009）——**只要融合就坏，与格式细节无关**。
+4. **不是 FC 累加精度这个当初的假设**：融合 kernel 内部实现问题（可能是 int8/u4 解量化路径的 kernel bug）。
+
+### 10.2 图级修复尝试（均失败）
+
+| 尝试 | 结果 |
+|---|---|
+| 图改写把 K-quant MatMul 输入/输出抬 f32（`apply_fc_f32`，权重码本保持 u4/i8，IR 体积不变） | GPU 编译时被插件的精度降级 pass **打回 f16**，结果纹丝不动 |
+| rt_info `"precision_sensitive"` 标记（模仿 `ov::mark_as_precision_sensitive`） | python 无法写入真正的 `PrecisionSensitive` 属性类型，无效 |
+| `INFERENCE_PRECISION_HINT=f32`（全图） | ✅ 数值完全正确（err 0.0078），**但插件把解量化权重物化成 f32 常量：7.2B 全图 ~27GB → 系统级换页 250s/token** |
+
+关键对照：L=2/L=8 分块口径下 f32 hint 只慢 ~1.6×（34ms vs 18ms）→ 全图 250s/token **不是算力问题，是 f32 权重物化爆内存**。32 块逐层分块 + f32 hint 总物化仍是 ~27GB（所有 chunk 常驻），同样撞墙——该路线也一并否决。
+
+### 10.3 决定（2026-08-31）
+
+- **GPU 实验暂停**（用户决定）：期间 27GB 级物化实验疑似导致主机重启一次，此后 16GB+ 物化内存的实验一律先估算再跑。
+- 已交付：`apply_fc_f32`（rwkv7_ov.py，留作 OV 上游修复后的开关）、三个探针脚本（单 op 精度 / dequant 保真 / 逐 op 二分）、`ov_chunk_bench.py`（参数化分块 bench，支持任意设备+f32 hint）、`scripts/ffn_degradation_probe.py`（§9）。
+- 现状盘点：**7.2B 可用路径 = CPU 分块（~0.7 t/s 级，内存最优）**；GPU f16 单图 3.23 t/s 但乱码；GPU 正确性修复需等 OV 上游（或 C++ 侧真正用上 `mark_as_precision_sensitive` / 自定义 int4 op，预期收益有限）。
+- 遗留物：`out/rwkv7-7.2b-q4k_ov.xml/bin`（6GB 单图 IR，CPU/GPU 均判死，可删）；`out/chunks_7.2b/`（32 块逐层 IR，CPU 分块执行器直接可用）。
